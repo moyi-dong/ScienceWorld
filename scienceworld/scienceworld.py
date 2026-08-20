@@ -194,6 +194,34 @@ class ScienceWorldEnv:
         ''' Get the maximum number of variations for the tasks. '''
         return self.server.getTaskMaxVariations(infer_task(task_name))
 
+    def configure_aer_pea_case(
+        self, world_name: str = "white_preference", case_root: int = 0
+    ) -> str:
+        """Configure the hidden AER pea world before loading or resetting it.
+
+        This is an operator-facing hook. Solver-facing wrappers must not expose
+        it or the hidden event accessors below.
+        """
+        if isinstance(case_root, bool) or not isinstance(case_root, int) or case_root < 0:
+            raise ValueError("case_root must be a non-negative integer")
+        return self.server.configureAERPeaCase(world_name, case_root)
+
+    def get_aer_pea_case_events(self) -> List[Dict[str, Any]]:
+        """Return lossless AER events for deterministic grading and tests."""
+        return json.loads(self.server.getAERPeaCaseEventsJSON())
+
+    def get_aer_pea_case_summary(self) -> Dict[str, Any]:
+        """Return an operator-facing summary of comparable flower visits."""
+        return json.loads(self.server.getAERPeaCaseSummaryJSON())
+
+    def get_aer_pea_case_reproduction_events(self) -> List[Dict[str, Any]]:
+        """Return operator-facing pollination and fruit timing events."""
+        return json.loads(self.server.getAERPeaCaseReproductionEventsJSON())
+
+    def get_aer_pea_case_worlds(self) -> List[str]:
+        """Return the hidden AER pea worlds supported by this build."""
+        return json.loads(self.server.getAERPeaCaseWorldsJSON())
+
     # Get possible actions
     def get_possible_actions(self) -> List[str]:
         ''' Get all possible actions in the current environment state. '''
@@ -407,11 +435,14 @@ class ScienceWorldEnv:
             return ["ERROR: Gold path was not generated.  Set `generateGoldPath` flag to true when calling load()."]
 
     # Step
-    def step(self, input_str: str) -> Tuple[str, int, bool, Dict[str, Any]]:
+    def step(
+        self, input_str: str, include_valid: bool = True
+    ) -> Tuple[str, int, bool, Dict[str, Any]]:
         '''Take a step.
 
         This function takes one step in the typical state-action-reward cycle of RL.
         :param input_str: The input string supplied to the simulator from an agent.
+        :param include_valid: Whether to materialize the potentially large valid-action list.
 
         Returns the observation, reward, completion status, and infos dict consisting of:
         'moves', 'score', 'reward', 'look', 'inv', 'taskDesc', 'valid', 'variationIdx', 'taskName',
@@ -443,7 +474,7 @@ class ScienceWorldEnv:
             'look': self.look(),
             'inv': self.inventory(),
             'taskDesc': self.taskdescription(),
-            'valid': self.get_valid_action_object_combinations(),
+            'valid': self.get_valid_action_object_combinations() if include_valid else [],
             'variationIdx': self.variationIdx,
             'taskName': self.taskName,
             'simplificationStr': self.simplificationStr,

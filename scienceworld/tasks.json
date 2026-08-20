@@ -178,5 +178,11 @@
         "topic": "Biology",
         "task": "Mendelian Genetics (unknown plants)",
         "task_name": "mendelian-genetics-unknown-plant"
+    },
+    {
+        "task_id": "10-3",
+        "topic": "Biology",
+        "task": "Mendelian Genetics (known plant, AER white-flower preference)",
+        "task_name": "mendelian-genetics-known-plant-aer"
     }
 ]

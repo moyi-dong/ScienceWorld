@@ -10,6 +10,7 @@ import scienceworld.tasks.goals.{Goal, GoalSequence}
 import scienceworld.tasks.goals.specificgoals.{GoalContainerOpen, GoalFind, GoalFindInclinedPlaneNamed, GoalInRoomWithObject, GoalLifeStageAnywhere, GoalMoveToLocation, GoalMoveToNewLocation, GoalSpecificObjectInDirectContainer}
 import TaskMendelianGenetics1._
 import scienceworld.actions.Action
+import scienceworld.aer.AERFlowerColorSleeve
 import scienceworld.goldagent.PathFinder
 import scienceworld.objects.containers.furniture.BeeHive
 import scienceworld.objects.containers.{CeramicCup, FlowerPot, Jug, SelfWateringFlowerPot}
@@ -17,7 +18,7 @@ import scienceworld.objects.livingthing.LivingThing
 import scienceworld.objects.livingthing.plant.{PeaPlant, Plant, Soil}
 import scienceworld.objects.substance.food.Fruit
 import scienceworld.objects.taskitems.AnswerBox
-import scienceworld.processes.genetics.{Chromosomes, GeneticTrait, GeneticTraitPeas}
+import scienceworld.processes.genetics.{ChromosomePair, Chromosomes, GeneticTrait, GeneticTraitPeas}
 import scienceworld.processes.lifestage.PlantLifeStages.{PLANT_STAGE_ADULT_PLANT, PLANT_STAGE_REPRODUCING, PLANT_STAGE_SEED, PLANT_STAGE_SEEDLING}
 import scienceworld.runtime.pythonapi.PythonInterface
 
@@ -28,12 +29,17 @@ import scala.util.control.Breaks.{break, breakable}
 
 class TaskMendelianGenetics1(val mode:String = MODE_MENDEL_KNOWN) extends TaskParametric {
   val taskName = mode.replaceAll(" ", "-").replaceAll("[()]", "")
+  val isAERMode:Boolean = mode == MODE_MENDEL_KNOWN_AER
 
   val locations = Array("greenhouse")
 
   // Variation 1: Genetic Trait
   val genetics = new ArrayBuffer[ Array[TaskModifier] ]()
-  val traitNames = Array(GeneticTrait.TRAIT_PLANT_HEIGHT, GeneticTrait.TRAIT_SEED_SHAPE, GeneticTrait.TRAIT_SEED_COLOR, GeneticTrait.TRAIT_SEED_SHAPE)
+  val traitNames = if (isAERMode) {
+    Array(GeneticTrait.TRAIT_PLANT_HEIGHT)
+  } else {
+    Array(GeneticTrait.TRAIT_PLANT_HEIGHT, GeneticTrait.TRAIT_SEED_SHAPE, GeneticTrait.TRAIT_SEED_COLOR, GeneticTrait.TRAIT_SEED_SHAPE)
+  }
 
   // Generate a random set of traits, just to determine which are dominant/recessive.
   val traits = new Chromosomes(GeneticTraitPeas.mkRandomTraits())
@@ -49,14 +55,21 @@ class TaskMendelianGenetics1(val mode:String = MODE_MENDEL_KNOWN) extends TaskPa
           specificTraitValue = traits.getTrait(traitName).get.valueRecessive
         }
 
-        val seedJar = TaskMendelianGenetics1.mkPeaPlantSeedJar(traitName)
+        val seedJar = TaskMendelianGenetics1.mkPeaPlantSeedJar(traitName, fixedFlowerContrast = isAERMode)
 
-        genetics.append(Array(new TaskObject(seedJar.name, Some(seedJar), roomToGenerateIn = location, Array.empty[String], generateNear = 0, forceAdd = true),
-                              new TaskValueStr(key = "domOrRec", value = domOrRec),
-                              new TaskValueStr(key = "traitName", value = traitName),
-                              new TaskValueStr(key = "traitValue", value = specificTraitValue),
-                              new TaskValueStr(key = "seedType", value = "pea")
-                              ) )
+        val modifiers = new ArrayBuffer[TaskModifier]()
+        modifiers.append(new TaskObject(seedJar.name, Some(seedJar), roomToGenerateIn = location, Array.empty[String], generateNear = 0, forceAdd = true))
+        if (isAERMode) {
+          val whiteSleeve = new AERFlowerColorSleeve("white")
+          val purpleSleeve = new AERFlowerColorSleeve("purple")
+          modifiers.append(new TaskObject(whiteSleeve.name, Some(whiteSleeve), roomToGenerateIn = location, Array.empty[String], generateNear = 0, forceAdd = true))
+          modifiers.append(new TaskObject(purpleSleeve.name, Some(purpleSleeve), roomToGenerateIn = location, Array.empty[String], generateNear = 0, forceAdd = true))
+        }
+        modifiers.append(new TaskValueStr(key = "domOrRec", value = domOrRec))
+        modifiers.append(new TaskValueStr(key = "traitName", value = traitName))
+        modifiers.append(new TaskValueStr(key = "traitValue", value = specificTraitValue))
+        modifiers.append(new TaskValueStr(key = "seedType", value = "pea"))
+        genetics.append(modifiers.toArray)
 
       }
     }
@@ -167,7 +180,7 @@ class TaskMendelianGenetics1(val mode:String = MODE_MENDEL_KNOWN) extends TaskPa
     val gSequence = new ArrayBuffer[Goal]
     val gSequenceUnordered = new ArrayBuffer[Goal]
     var description:String = "<empty>"
-    if (mode == MODE_MENDEL_KNOWN) {
+    if ((mode == MODE_MENDEL_KNOWN) || (mode == MODE_MENDEL_KNOWN_AER)) {
 
       if (domOrRec.get == GeneticTrait.DOMINANT) {
         // Dominant
@@ -250,7 +263,7 @@ class TaskMendelianGenetics1(val mode:String = MODE_MENDEL_KNOWN) extends TaskPa
    * Gold Action Sequences
    */
   def mkGoldActionSequence(modifiers:Array[TaskModifier], runner:PythonInterface): (Boolean, Array[String]) = {
-    if (mode == MODE_MENDEL_KNOWN) {
+    if ((mode == MODE_MENDEL_KNOWN) || (mode == MODE_MENDEL_KNOWN_AER)) {
       return mkGoldActionSequenceMendel(modifiers, runner)
     } else {
       throw new RuntimeException("ERROR: Unrecognized task mode: " + mode)
@@ -602,9 +615,11 @@ class TaskMendelianGenetics1(val mode:String = MODE_MENDEL_KNOWN) extends TaskPa
 
 object TaskMendelianGenetics1 {
   val MODE_MENDEL_KNOWN             = "mendelian genetics (known plant)"
+  val MODE_MENDEL_KNOWN_AER         = "mendelian genetics (known plant aer)"
 
   def registerTasks(taskMaker:TaskMaker1): Unit = {
     taskMaker.addTask( new TaskMendelianGenetics1(mode = MODE_MENDEL_KNOWN) )
+    taskMaker.addTask( new TaskMendelianGenetics1(mode = MODE_MENDEL_KNOWN_AER) )
   }
 
 
@@ -613,7 +628,31 @@ object TaskMendelianGenetics1 {
    */
 
   // Make a set of inclined planes
-  def mkPeaPlantSeedJar(traitName:String):EnvObject = {
+  def mkPeaPlantSeedJar(traitName:String, fixedFlowerContrast:Boolean = false):EnvObject = {
+    if (fixedFlowerContrast) {
+      if (traitName != GeneticTrait.TRAIT_PLANT_HEIGHT) {
+        throw new RuntimeException("The AER pea task currently supports only plant height.")
+      }
+
+      // G0 remains a pure dominant-height x pure recessive-height cross.  The
+      // extra fixed locus guarantees one purple and one white parent flower.
+      val dom = mkFixedPeaChromosomePair(
+        heightAllele = GeneticTrait.DOMINANT,
+        flowerColorAllele = GeneticTrait.DOMINANT
+      )
+      val rec = mkFixedPeaChromosomePair(
+        heightAllele = GeneticTrait.RECESSIVE,
+        flowerColorAllele = GeneticTrait.RECESSIVE
+      )
+      val plantDom = new PeaPlant(_chromosomePairs = Some(dom))
+      val plantRec = new PeaPlant(_chromosomePairs = Some(rec))
+      val jar = new CeramicCup()
+      jar.name = "seed jar"
+      jar.addObject(plantDom)
+      jar.addObject(plantRec)
+      return jar
+    }
+
     // Double-dominant
     val dom = GeneticTraitPeas.mkRandomChromosomePairExcept(traitName, GeneticTrait.DOMINANT, GeneticTrait.DOMINANT)
     val plantDom = new PeaPlant(_chromosomePairs = Some(dom) )
@@ -630,6 +669,20 @@ object TaskMendelianGenetics1 {
 
     // Return
     jar
+  }
+
+  private def mkFixedPeaChromosomePair(heightAllele:String, flowerColorAllele:String):ChromosomePair = {
+    def alleles():Array[GeneticTrait] = Array(
+      GeneticTraitPeas.mkTraitPlantHeight(heightAllele),
+      GeneticTraitPeas.mkTraitPeaShape(GeneticTrait.DOMINANT),
+      GeneticTraitPeas.mkTraitPeaColor(GeneticTrait.DOMINANT),
+      GeneticTraitPeas.mkTraitFlowerColor(flowerColorAllele)
+    )
+
+    new ChromosomePair(
+      new Chromosomes(alleles()),
+      new Chromosomes(alleles())
+    )
   }
 
   // Make N flower pots

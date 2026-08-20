@@ -2,6 +2,7 @@ package scienceworld.runtime
 
 import language.model.{ActionRequestDef, ActionTrigger, ParamSig, ParamSigList}
 import main.scala.scienceworld.runtime.SimplifierProcessor
+import scienceworld.aer.AERPeaCase
 import scienceworld.actions.{Action, ActionInventory, ActionLookAround, ActionTaskDesc}
 import scienceworld.input.{ActionDefinitions, ActionHandler, ExampleAction, InputParser}
 import scienceworld.objects.agent.Agent
@@ -555,6 +556,7 @@ class AgentInterface(val universe:EnvObject, val agent:Agent, val task:Task, var
 
           // Run universe tick
           if (willActionsTakeTime) {
+            AERPeaCase.advanceTick()
             universe.clearTickProcessedRecursive()
             universe.tick()
 
@@ -587,6 +589,15 @@ class AgentInterface(val universe:EnvObject, val agent:Agent, val task:Task, var
 
     val score = task.goalSequence.score()
     val isCompleted = task.goalSequence.isCompleted()
+
+    // AER observations are ordinary world events produced during the same
+    // ticks as the requested action.  They are appended to the observation,
+    // rather than exposed through a dedicated "notice anomaly" command.
+    val aerEvents = AERPeaCase.consumePublicEvents()
+    if (aerEvents.length > 0) {
+      if (userOutStr.length > 0) userOutStr.append("\n\n")
+      userOutStr.append(aerEvents)
+    }
 
     // Return action string
     val outStr = userOutStr.toString().trim.replaceAll(" +", " ")

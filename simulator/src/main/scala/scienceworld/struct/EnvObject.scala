@@ -1,5 +1,6 @@
 package scienceworld.struct
 
+import scienceworld.aer.AERPeaCase
 import scienceworld.objects.portal.Portal
 import scienceworld.properties.{ContainerProperties, CoolingSourceProperties, DeviceProperties, EdibilityProperties, ElectricalConnectionProperties, HeatSourceProperties, LifeProperties, MaterialProperties, MoveableProperties, PollinationProperties, PortalProperties}
 import scienceworld.processes.{Combustion, ElectricalConductivity, HeatTransfer, StateOfMatter}
@@ -513,16 +514,26 @@ class EnvObject(var name:String, var objType:String, includeElectricalTerminals:
     println("")
      */
 
+    // Sets do not promise a stable iteration order across reconstructed
+    // environments.  Tick by UUID so a reset plus the same action sequence
+    // consumes random numbers in the same order.
+    val containedObjects = this.getContainedObjects().toArray
+    val orderedContainedObjects = if (AERPeaCase.isActive) {
+      containedObjects.sortBy(_.uuid)
+    } else {
+      containedObjects
+    }
+
     // Combustion: Handle object combustion
     Combustion.combustionTick(this)
 
     // Heat transfer: Conductive heat transfer between this container and all objects in the container (container to obj)
-    for (containedObj <- this.getContainedObjects()) {
+    for (containedObj <- orderedContainedObjects) {
       HeatTransfer.heatTransferTouchingObjects(this, containedObj)
     }
 
     // Heat transfer: Conductive heat transfer between all objects in this container (obj to obj)
-    val containedObjs = this.getContainedObjects().toArray
+    val containedObjs = orderedContainedObjects
     for (i <- 0 until containedObjs.length) {
       for (j <- 0 until i) {
         if (i != j) {
@@ -539,10 +550,12 @@ class EnvObject(var name:String, var objType:String, includeElectricalTerminals:
 
 
     // Run tick for all objects further down in the object tree
-    for (containedObj <- this.getContainedObjects()) {
+    for (containedObj <- orderedContainedObjects) {
       containedObj.tick()
     }
-    for (portalObj <- this.getPortals()) {      //## TODO: Verify that the portal tick was run only once?
+    val portals = this.getPortals().toArray
+    val orderedPortals = if (AERPeaCase.isActive) portals.sortBy(_.uuid) else portals
+    for (portalObj <- orderedPortals) {      //## TODO: Verify that the portal tick was run only once?
       portalObj.tick()
     }
 

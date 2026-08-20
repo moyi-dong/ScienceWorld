@@ -3,6 +3,7 @@ package scienceworld.runtime.pythonapi
 import java.io.{File, FileOutputStream,PrintWriter}
 
 import main.scala.scienceworld.runtime.SimplifierProcessor
+import scienceworld.aer.AERPeaCase
 import scienceworld.environments.EnvironmentMaker
 import scienceworld.goldagent.RunHistory
 import scienceworld.input.{ActionDefinitions, InputParser}
@@ -99,6 +100,7 @@ class PythonInterface() {
     this.taskStr = taskStr
     this.taskVariationIdx = variationIdx
     this.simplificationStr = simplificationStr
+    AERPeaCase.beginEpisode(taskStr, variationIdx)
 
     // Clear error string
     this.errorStr = ""
@@ -160,6 +162,23 @@ class PythonInterface() {
   def getTaskMaxVariations(taskName:String): Int = {
     taskMaker.getMaxVariations(taskName)
   }
+
+  /*
+   * AER pea-case operator API.  The benchmark harness may use these methods;
+   * they are not intended to be exposed inside the solver container.
+   */
+  def configureAERPeaCase(worldName:String, caseRoot:Int):String = {
+    AERPeaCase.configureWorld(worldName, caseRoot)
+    return worldName + ":" + caseRoot
+  }
+
+  def getAERPeaCaseEventsJSON():String = AERPeaCase.eventsJSON
+
+  def getAERPeaCaseReproductionEventsJSON():String = AERPeaCase.reproductionEventsJSON
+
+  def getAERPeaCaseSummaryJSON():String = AERPeaCase.summaryJSON
+
+  def getAERPeaCaseWorldsJSON():String = AERPeaCase.supportedWorldsJSON
 
 
   /*

@@ -1,5 +1,6 @@
 package scienceworld.processes.lifestage
 
+import scienceworld.aer.AERPeaCase
 import scienceworld.objects.livingthing.plant.{Flower, Plant}
 import scienceworld.struct.EnvObject
 
@@ -288,7 +289,7 @@ class PlantLifeStageReproduction(obj:Plant, lifecycle:LifeCycle) extends LifeSta
 
     ticksMeetingCriteria += 1
     if (ticksMeetingCriteria >= stageDuration) {
-      val maxFlowers = 1
+      val maxFlowers = AERPeaCase.maxFlowersPerPlant
 
       // Create a flower
       val existingFlowers = obj.getContainedObjectsOfType[Flower]()

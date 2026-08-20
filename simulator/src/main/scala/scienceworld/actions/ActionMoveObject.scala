@@ -8,6 +8,8 @@ import scienceworld.objects.portal.Door
 import scienceworld.input.ActionDefinitions.mkActionRequest
 import scienceworld.input.{ActionDefinitions, ActionHandler}
 import scienceworld.objects.agent.Agent
+import scienceworld.aer.AERFlowerColorSleeve
+import scienceworld.objects.livingthing.plant.Plant
 import scienceworld.struct.EnvObject
 
 import scala.collection.mutable
@@ -99,6 +101,15 @@ object ActionMoveObject {
 
     if (!container.propContainer.get.isOpen) {
       return ("That can't be moved there, because the " + container.name + " isn't open.", false)
+    }
+
+    // A flower-colour sleeve is an ordinary movable object, but a plant can
+    // wear only one at a time so the perceived colour is never ambiguous.
+    if (objToMove.isInstanceOf[AERFlowerColorSleeve] && container.isInstanceOf[Plant]) {
+      val hasSleeve = container.getContainedObjects().exists(_.isInstanceOf[AERFlowerColorSleeve])
+      if (hasSleeve) {
+        return ("The " + container.name + " already has a flower color sleeve.", false)
+      }
     }
 
     // If we reach here, all tests have passed

@@ -1,5 +1,6 @@
 package scienceworld.objects.livingthing.plant
 
+import scienceworld.aer.{AERFlowerColorSleeve, AERPeaCase}
 import scienceworld.objects.devices.Stove
 import scienceworld.objects.livingthing.LivingThing
 import scienceworld.objects.substance.food.Apple
@@ -166,7 +167,7 @@ class Pollen(val parentPlant:Plant) extends EnvObject {
 /*
  * Flower
  */
-class Flower(parentPlant:Plant) extends EnvObject {
+class Flower(val parentPlant:Plant) extends EnvObject {
   this.name = "flower"
 
   this.propContainer = Some(new IsOpenUnclosableContainer())
@@ -174,6 +175,27 @@ class Flower(parentPlant:Plant) extends EnvObject {
 
   // A step referring to where the flower is in the pollination -> fruiting process.  If the pollination step is zero, the flower hasn't been pollinated.
   this.propPollination = Some( new PollinationProperties() )
+
+  def getNativeColor:String = {
+    if (parentPlant.propChromosomePairs.isEmpty) return "unknown"
+    parentPlant.propChromosomePairs.get
+      .getPhenotypeValue(GeneticTrait.TRAIT_FLOWER_COLOR)
+      .getOrElse("unknown")
+  }
+
+  // A movable public sleeve can alter what pollinators see without rewriting
+  // the plant's chromosomes or its native flower description.
+  def getPerceivedColor:String = {
+    val sleeves = parentPlant.getContainedObjects().collect {
+      case sleeve:AERFlowerColorSleeve => sleeve
+    }.toArray.sortBy(_.uuid)
+    sleeves.headOption.map(_.perceivedColor).getOrElse(this.getNativeColor)
+  }
+
+  private def orderedForAER(objects:Set[EnvObject]):Array[EnvObject] = {
+    val unpacked = objects.toArray
+    if (AERPeaCase.isActive) unpacked.sortBy(_.uuid) else unpacked
+  }
 
 
   def pollinate(pollen:Pollen):Boolean = {
@@ -193,6 +215,8 @@ class Flower(parentPlant:Plant) extends EnvObject {
 
     // If we reach here, the pollen should be valid.
 
+    if (AERPeaCase.isActive) AERPeaCase.recordPollination(this, pollen)
+
     // Step 2: Consume pollen
     pollen.delete()
 
@@ -210,7 +234,7 @@ class Flower(parentPlant:Plant) extends EnvObject {
   def addPollen(): Unit = {
 
     // Step 1: Check if some of this plant's pollen already exists in this flower
-    for (cObj <- this.getContainedObjects()) {
+    for (cObj <- orderedForAER(this.getContainedObjects())) {
       cObj match {
         case p:Pollen => {
           if (p.parentPlant.uuid == this.parentPlant.uuid) {
@@ -260,7 +284,7 @@ class Flower(parentPlant:Plant) extends EnvObject {
     // If currently pollinated, continue the pollination process
     if (this.propPollination.get.pollinationStep > 0) {
       // Increment step
-      this.propPollination.get.pollinationStep += 1
+      this.propPollination.get.pollinationStep += AERPeaCase.pollinationStepIncrement(this)
 
       if (this.propPollination.get.pollinationStep > this.propPollination.get.stepsUntilFruitingBodyForms) {
         // TODO: Change into fruit
@@ -273,6 +297,7 @@ class Flower(parentPlant:Plant) extends EnvObject {
 
           val fruit = PlantReproduction.createFruit(this.parentPlant.getPlantType(), parent1Chromosomes, parent2Chromosomes)
           if (fruit.isDefined) {
+            if (AERPeaCase.isActive) AERPeaCase.recordFruitSet(this)
             this.getContainer().get.addObject( fruit.get )
           }
 
@@ -289,7 +314,7 @@ class Flower(parentPlant:Plant) extends EnvObject {
 
       // Step 2B: Check if any of the things in the flower contain (valid) pollen -- if so, start the pollination process.
       breakable {
-        for (cObj <- this.getContainedObjects()) { // For every object in the flower
+        for (cObj <- orderedForAER(this.getContainedObjects())) { // For every object in the flower
           cObj match {
             case p: Pollen => {
               // Check to see if this is valid pollen, and if so, begin the pollination process
@@ -297,7 +322,7 @@ class Flower(parentPlant:Plant) extends EnvObject {
             }
             case obj: EnvObject => {
               // Check objects contained in the flower (e.g. bees) to see if they contain pollen
-              for (ccObj <- obj.getContainedObjects()) {
+              for (ccObj <- orderedForAER(obj.getContainedObjects())) {
                 ccObj match {
                   case p: Pollen => {
                     // Check to see if this is valid pollen, and if so, begin the pollination process

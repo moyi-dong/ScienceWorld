@@ -1,5 +1,6 @@
 package scienceworld.objects.livingthing.animals
 
+import scienceworld.aer.AERPeaCase
 import scienceworld.objects.livingthing.LivingThing
 import scienceworld.objects.livingthing.plant.{Flower, Pollen}
 import scienceworld.objects.location.Location
@@ -23,7 +24,12 @@ class WanderingAnimal extends Animal {
     if (this.getContainer().isEmpty) return false
     val currentLocation = this.getContainer().get
 
-    val passablePortals = currentLocation.getPortals().filter(_.isCurrentlyPassable()).toArray
+    val unsortedPassablePortals = currentLocation.getPortals().filter(_.isCurrentlyPassable()).toArray
+    val passablePortals = if (AERPeaCase.isActive && this.isInstanceOf[Bee]) {
+      unsortedPassablePortals.sortBy(_.uuid)
+    } else {
+      unsortedPassablePortals
+    }
     // println ("### Passable Portals: " + passablePortals.map(_.name).mkString(", "))
 
     if (passablePortals.size == 0) {
@@ -47,7 +53,11 @@ class WanderingAnimal extends Animal {
     }
 
     // Step 2: Pick a random location
-    val randIdx = Random.nextInt(passablePortals.size)
+    val randIdx = if (AERPeaCase.isActive && this.isInstanceOf[Bee]) {
+      AERPeaCase.nextBeeMovement(this.uuid, passablePortals.size)
+    } else {
+      Random.nextInt(passablePortals.size)
+    }
     val moveLocation = passablePortals(randIdx).getConnectsTo(perspectiveContainer = currentLocation)
 
     // Step 2B: Move to that random location
@@ -110,18 +120,27 @@ class Bee extends WanderingAnimal {
     val currentLocation = this.getContainer().get
 
     // Check if there are any flowers
-    val flowers = currentLocation.getContainedAccessibleObjectsOfType[Flower]().toArray
+    val flowers = currentLocation.getContainedAccessibleObjectsOfType[Flower]().toArray.collect {
+      case flower:Flower => flower
+    }
     // println ("flowers: " + flowers.mkString(", "))
     // println ("accessible objects: " + currentLocation.getContainedAccessibleObjects().map(_.name).mkString(", ") )
 
     if (flowers.size == 0) return false
 
-    // Pick random flower
-    val randIdx = Random.nextInt( flowers.size )
-    val flower = flowers(randIdx)
+    // The upstream environment samples uniformly.  The AER task replaces only
+    // this choice rule; movement, pollen collection, pollination, and fruiting
+    // continue through the original object simulation.
+    val flower = if (AERPeaCase.isActive) {
+      AERPeaCase.chooseFlower(this.uuid, flowers)
+    } else {
+      val randIdx = Random.nextInt(flowers.size)
+      flowers(randIdx)
+    }
 
     // Move into flower
     flower.addObject( this )
+    if (AERPeaCase.isActive) AERPeaCase.recordVisit(this, flower, flowers)
 
     // Return success
     return true
@@ -142,9 +161,14 @@ class Bee extends WanderingAnimal {
     val pollens = currentLocation.getContainedObjectsOfType[Pollen]().toArray
     if (pollens.size == 0) return false
 
-    // Pick random pollen
-    val randIdx = Random.nextInt( pollens.size )
-    val pollen = pollens(randIdx)
+    // Pollen in a flower comes from the same parent plant.  Sorting in the AER
+    // case avoids Set iteration order changing which random number is consumed.
+    val pollen = if (AERPeaCase.isActive) {
+      pollens.sortBy(_.uuid).head
+    } else {
+      val randIdx = Random.nextInt(pollens.size)
+      pollens(randIdx)
+    }
 
     // Move into bee
     this.addObject( pollen )
@@ -174,7 +198,7 @@ class Bee extends WanderingAnimal {
     // Do actions
     if (this.isInFlower()) {
       // If the bee is in a flower
-      val randAction = Random.nextInt(2)
+      val randAction = if (AERPeaCase.isActive) AERPeaCase.nextBeeAction(this.uuid, 2) else Random.nextInt(2)
       if (randAction == 0) {
         this.collectPollen()
       } else {
@@ -183,7 +207,7 @@ class Bee extends WanderingAnimal {
 
     } else {
       // If the bee is outside a flower
-      val randAction = Random.nextInt(2)
+      val randAction = if (AERPeaCase.isActive) AERPeaCase.nextBeeAction(this.uuid, 2) else Random.nextInt(2)
       if (randAction == 1) {
         this.moveIntoFlower()
       } else {

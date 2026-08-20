@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aer-bench.local/schemas/mendelian-genetics-known-plant-aer.json",
+  "title": "AER pea discovery submission",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["height_trait", "completed", "evidence", "anomaly"],
+  "properties": {
+    "height_trait": {
+      "type": "string",
+      "enum": ["dominant", "recessive", "undetermined"]
+    },
+    "completed": {"type": "boolean"},
+    "evidence": {"type": "string", "minLength": 1},
+    "anomaly": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "surface",
+        "persistent_anomaly",
+        "mechanism_id",
+        "notice_record_id",
+        "evidence_experiment_ids",
+        "validation_experiment_id"
+      ],
+      "properties": {
+        "surface": {
+          "type": "string",
+          "enum": [
+            "visit_imbalance",
+            "fruit_set_timing",
+            "measurement_discrepancy",
+            "none",
+            "undetermined"
+          ]
+        },
+        "persistent_anomaly": {"type": "boolean"},
+        "mechanism_id": {
+          "type": "string",
+          "enum": [
+            "perceived_flower_color",
+            "flower_pot_position",
+            "plant_identity",
+            "post_pollination_fruit_set_speed",
+            "finite_sample_fluctuation",
+            "uniform_no_anomaly",
+            "undetermined"
+          ]
+        },
+        "notice_record_id": {"type": ["string", "null"], "pattern": "^NOTE-[0-9]{4}$"},
+        "evidence_experiment_ids": {
+          "type": "array",
+          "items": {"type": "string", "pattern": "^EXP-[A-Za-z0-9_-]{1,32}$"}
+        },
+        "validation_experiment_id": {
+          "type": ["string", "null"],
+          "pattern": "^EXP-[A-Za-z0-9_-]{1,32}$"
+        }
+      }
+    }
+  }
+}
