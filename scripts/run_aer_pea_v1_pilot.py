@@ -103,6 +103,12 @@ PUBLIC_HELP = {
             "max_ticks": 100,
             "maintain_water": True,
         },
+        "observe-visits": {
+            "targets": ["flower pot 1", "flower pot 3"],
+            "min_visits": 12,
+            "max_ticks": 100,
+            "maintain_water": True,
+        },
     },
     "wait_conditions": [
         "seedling", "adult", "reproducing", "flowering", "fruit", "resolved"
@@ -358,6 +364,94 @@ class V1EpisodeService(EpisodeService):
             self._step("wait1", source="v1_wait_until")
         raise AssertionError("unreachable")
 
+    def _observe_visits(
+        self,
+        targets: list[str],
+        min_visits: int,
+        max_ticks: int,
+        maintain_water: bool,
+    ) -> dict[str, Any]:
+        if (
+            isinstance(min_visits, bool)
+            or not isinstance(min_visits, int)
+            or not 1 <= min_visits <= 200
+        ):
+            raise ValueError("min_visits must be an integer from 1 to 200")
+        if (
+            isinstance(max_ticks, bool)
+            or not isinstance(max_ticks, int)
+            or not 1 <= max_ticks <= 500
+        ):
+            raise ValueError("max_ticks must be an integer from 1 to 500")
+        if not isinstance(maintain_water, bool):
+            raise ValueError("maintain_water must be true or false")
+
+        start_index = len(self.env.get_aer_pea_case_events())
+        target_set = set(targets)
+        water_mutations = 0
+        selected: list[dict[str, Any]] = []
+        fresh: list[dict[str, Any]] = []
+        status = self._status(compact=True)
+        for elapsed in range(max_ticks + 1):
+            fresh = self.env.get_aer_pea_case_events()[start_index:]
+            selected = [event for event in fresh if event["flower_pot"] in target_set]
+            if len(selected) >= min_visits or elapsed == max_ticks:
+                status = self._status(compact=True)
+                break
+            status = self._status(compact=True)
+            pots = self._pot_map(status)
+            if maintain_water:
+                dry = [
+                    target
+                    for target in targets
+                    if pots[target]["plant_count"] > 0 and not pots[target]["has_water"]
+                ]
+                if dry:
+                    water_result = self._water(dry)
+                    if not water_result.get("ok"):
+                        raise RuntimeError(water_result.get("error", "batch watering failed"))
+                    water_mutations += len(dry)
+            self._step("wait1", source="v1_observe_visits")
+        else:
+            raise AssertionError("unreachable")
+
+        by_flower: dict[int, dict[str, Any]] = {}
+        by_color: dict[str, int] = {}
+        for event in selected:
+            flower_id = event["flower_id"]
+            aggregate = by_flower.setdefault(
+                flower_id,
+                {
+                    "flower_id": flower_id,
+                    "plant_id": event["plant_id"],
+                    "flower_pot": event["flower_pot"],
+                    "perceived_color": event["perceived_color"],
+                    "plant_height": event["plant_height"],
+                    "visit_count": 0,
+                    "first_tick": event["tick"],
+                    "last_tick": event["tick"],
+                },
+            )
+            aggregate["visit_count"] += 1
+            aggregate["last_tick"] = event["tick"]
+            color = event["perceived_color"]
+            by_color[color] = by_color.get(color, 0) + 1
+
+        return {
+            "ok": True,
+            "kind": "observe-visits",
+            "targets": targets,
+            "requested_visit_count": min_visits,
+            "observed_visit_count": len(selected),
+            "out_of_scope_visit_count": len(fresh) - len(selected),
+            "elapsed_ticks": elapsed,
+            "timed_out": len(selected) < min_visits,
+            "water_mutations": water_mutations,
+            "visits_by_flower": [by_flower[key] for key in sorted(by_flower)],
+            "visits_by_perceived_color": dict(sorted(by_color.items())),
+            "status": status,
+        }
+
     def _controlled_cross(self, raw_crosses: Any) -> tuple[list[str], dict[str, Any]]:
         if not isinstance(raw_crosses, list) or not raw_crosses:
             raise ValueError("crosses must be a non-empty list")
@@ -389,7 +483,14 @@ class V1EpisodeService(EpisodeService):
         if command == "help":
             response = {"ok": True, "kind": "help", **PUBLIC_HELP}
             return self._record_v1_response(request, response)
-        if command not in {"pots", "operate", "cultivate", "controlled-cross", "wait-until"}:
+        if command not in {
+            "pots",
+            "operate",
+            "cultivate",
+            "controlled-cross",
+            "wait-until",
+            "observe-visits",
+        }:
             return super().handle(request)
 
         with self._lock:
@@ -490,6 +591,23 @@ class V1EpisodeService(EpisodeService):
                             spec.get("maintain_water", True),
                             attempt_ids,
                         )
+                    elif command == "observe-visits":
+                        required = {"targets", "min_visits", "max_ticks"}
+                        optional = {"maintain_water"}
+                        if not required.issubset(spec) or not set(spec).issubset(
+                            required | optional
+                        ):
+                            raise ValueError(
+                                "observe-visits requires targets, min_visits, and max_ticks; "
+                                "maintain_water is optional"
+                            )
+                        targets = self._validate_targets(spec["targets"])
+                        response = self._observe_visits(
+                            targets,
+                            spec["min_visits"],
+                            spec["max_ticks"],
+                            spec.get("maintain_water", True),
+                        )
                     else:
                         required = {"assignments", "target_stage", "max_ticks"}
                         optional = {"maintain_water"}
@@ -546,6 +664,7 @@ Use only the public client in this workspace. Useful commands are:
 - `python3 lab.py cultivate '<JSON>'` to sow, water, and wait for explicitly assigned pots
 - `python3 lab.py controlled-cross '<JSON>'` for explicit recipient/donor crosses
 - `python3 lab.py wait-until '<JSON>'` with exact targets or cross attempt IDs
+- `python3 lab.py observe-visits '<JSON>'` to collect and aggregate a target visit sample
 - `python3 lab.py valid 'filter text'` and `python3 lab.py act 'one simulator action'`
 - `python3 lab.py record '<JSON>'` to timestamp a structured lab-notebook entry
 

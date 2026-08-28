@@ -5,7 +5,10 @@ from pathlib import Path
 import pytest
 from scienceworld import ScienceWorldEnv
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+SCIENCEWORLD_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(SCIENCEWORLD_ROOT))
+sys.path.insert(0, str(SCIENCEWORLD_ROOT / "scripts"))
+from scripts.run_aer_pea_formulation_v0_5 import _compact_response  # noqa: E402
 from scripts.run_aer_pea_v1_pilot import (  # noqa: E402
     MATRIX_MANIFEST,
     V1EpisodeService,
@@ -381,9 +384,125 @@ def test_public_status_exposes_visible_active_flower_color_for_batch_selection(t
             for plant in planted
             for flower in plant["active_flowers"]
         )
-        assert all("native_color" not in flower for plant in planted for flower in plant["active_flowers"])
+        assert all(
+            "native_color" not in flower
+            for plant in planted
+            for flower in plant["active_flowers"]
+        )
     finally:
         service.close()
+
+
+def test_observe_visits_batches_sampling_and_exposes_only_public_aggregates(tmp_path):
+    run = tmp_path / "observe-visits"
+    run.mkdir()
+    service = V1EpisodeService(
+        "white_preference",
+        0,
+        15,
+        run / "trajectory.jsonl",
+        run / "windows.jsonl",
+        1_000,
+        NO_NOISE,
+    )
+    try:
+        cultivated = _cultivate_two(service)
+        targets = cultivated["targets"]
+        assert service.handle({"command": "act", "action": "go to greenhouse"})["ok"] is True
+        assert service.handle({"command": "act", "action": "open bee hive"})["ok"] is True
+
+        observed = service.handle(
+            {
+                "command": "observe-visits",
+                "spec": {
+                    "targets": targets,
+                    "min_visits": 8,
+                    "max_ticks": 100,
+                    "maintain_water": True,
+                },
+            }
+        )
+
+        assert observed["ok"] is True
+        assert observed["kind"] == "observe-visits"
+        assert observed["timed_out"] is False
+        assert observed["observed_visit_count"] >= 8
+        assert sum(observed["visits_by_perceived_color"].values()) == observed[
+            "observed_visit_count"
+        ]
+        assert sum(item["visit_count"] for item in observed["visits_by_flower"]) == observed[
+            "observed_visit_count"
+        ]
+        assert {item["flower_pot"] for item in observed["visits_by_flower"]} <= set(targets)
+        assert all(
+            set(item)
+            == {
+                "flower_id",
+                "plant_id",
+                "flower_pot",
+                "perceived_color",
+                "plant_height",
+                "visit_count",
+                "first_tick",
+                "last_tick",
+            }
+            for item in observed["visits_by_flower"]
+        )
+        public_json = json.dumps(observed)
+        assert "native_color" not in public_json
+        assert "selection_weight" not in public_json
+        assert "candidate_colors" not in public_json
+
+        rows = [json.loads(line) for line in (run / "trajectory.jsonl").read_text().splitlines()]
+        internal_waits = [row for row in rows if row["source"] == "v1_observe_visits"]
+        assert len(internal_waits) == observed["elapsed_ticks"]
+        assert all(
+            row["request"] == {"command": "act", "action": "wait1"}
+            for row in internal_waits
+        )
+    finally:
+        service.close()
+
+
+def test_observe_visits_validates_sampling_bounds(tmp_path):
+    service = _service(tmp_path)
+    try:
+        target = service.handle({"command": "pots"})["pots"][0]["name"]
+        invalid = service.handle(
+            {
+                "command": "observe-visits",
+                "spec": {"targets": [target], "min_visits": 0, "max_ticks": 10},
+            }
+        )
+        assert invalid == {"ok": False, "error": "min_visits must be an integer from 1 to 200"}
+    finally:
+        service.close()
+
+
+def test_terminal_compaction_preserves_visit_aggregates() -> None:
+    response = {
+        "ok": True,
+        "kind": "observe-visits",
+        "requested_visit_count": 8,
+        "observed_visit_count": 9,
+        "out_of_scope_visit_count": 2,
+        "water_mutations": 4,
+        "visits_by_flower": [
+            {
+                "flower_id": 3,
+                "plant_id": 5,
+                "flower_pot": "flower pot 2",
+                "perceived_color": "white",
+                "plant_height": "tall",
+                "visit_count": 9,
+                "first_tick": 20,
+                "last_tick": 31,
+            }
+        ],
+        "visits_by_perceived_color": {"white": 9},
+    }
+
+    assert _compact_response(response) == response
 
 
 def test_controlled_cross_resolves_to_one_pod_with_four_traceable_sibling_seeds(tmp_path):
