@@ -961,6 +961,12 @@ object AERPeaCase {
           "\"stage\":\"" + escapeJSON(plant.lifecycle.get.getCurStageName()) + "\"," +
           "\"height\":\"" + escapeJSON(plantHeight(plant)) + "\"," +
           "\"soil_lot_id\":\"" + soilLotName(plant) + "\"," +
+          "\"active_flowers\":[" + plantFlowers.map { flower =>
+            "{" +
+              "\"flower_id\":" + stableId(flowerIds, flower.uuid) + "," +
+              "\"perceived_color\":\"" + escapeJSON(flower.getPerceivedColor) + "\"" +
+              "}"
+          }.mkString(",") + "]," +
           "\"active_flower_ids\":[" + plantFlowers.map { flower =>
             stableId(flowerIds, flower.uuid)
           }.mkString(",") + "]}"

@@ -360,6 +360,32 @@ def test_public_status_exposes_soil_lot_but_not_hidden_multiplier(tmp_path):
         service.close()
 
 
+def test_public_status_exposes_visible_active_flower_color_for_batch_selection(tmp_path):
+    service = _service(tmp_path)
+    try:
+        result = _cultivate_two(service)
+        planted = [
+            plant
+            for pot in result["wait"]["status"]["pots"]
+            for plant in pot["plants"]
+        ]
+        assert planted
+        assert all(plant["active_flowers"] for plant in planted)
+        assert {
+            flower["perceived_color"]
+            for plant in planted
+            for flower in plant["active_flowers"]
+        } == {"purple", "white"}
+        assert all(
+            set(flower) == {"flower_id", "perceived_color"}
+            for plant in planted
+            for flower in plant["active_flowers"]
+        )
+        assert all("native_color" not in flower for plant in planted for flower in plant["active_flowers"])
+    finally:
+        service.close()
+
+
 def test_controlled_cross_resolves_to_one_pod_with_four_traceable_sibling_seeds(tmp_path):
     run = tmp_path / "controlled"
     run.mkdir()
