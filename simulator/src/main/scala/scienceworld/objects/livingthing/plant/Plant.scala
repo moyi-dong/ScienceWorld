@@ -199,8 +199,12 @@ class Flower(val parentPlant:Plant) extends EnvObject {
 
 
   def pollinate(pollen:Pollen):Boolean = {
+    pollinateControlled(pollen, allowSelf = false)
+  }
+
+  def pollinateControlled(pollen:Pollen, allowSelf:Boolean):Boolean = {
     // Step 1A: check to see if the pollen is this plant's pollen, or a different plant's pollen
-    if (pollen.parentPlant.uuid == this.parentPlant.uuid) {
+    if (!allowSelf && pollen.parentPlant.uuid == this.parentPlant.uuid) {
       // The pollen comes from this plant -- do not pollinate
       //## println ("#### POLLEN COMES FROM SAME PLANT")
       return false
@@ -295,10 +299,26 @@ class Flower(val parentPlant:Plant) extends EnvObject {
           //val parent2Chromosomes = parentPlant.propChromosomePairs
           val parent2Chromosomes = this.propPollination.get.parent2ChromosomePairs
 
-          val fruit = PlantReproduction.createFruit(this.parentPlant.getPlantType(), parent1Chromosomes, parent2Chromosomes)
-          if (fruit.isDefined) {
-            if (AERPeaCase.isActive) AERPeaCase.recordFruitSet(this)
-            this.getContainer().get.addObject( fruit.get )
+          if (AERPeaCase.isV04) {
+            if (AERPeaCase.shouldSetPod(this)) {
+              val seeds = (0 until 4).flatMap { _ =>
+                PlantReproduction.createFruit(
+                  this.parentPlant.getPlantType(), parent1Chromosomes, parent2Chromosomes
+                )
+              }.toArray
+              AERPeaCase.recordPodSet(this, seeds)
+              seeds.foreach(seed => this.getContainer().get.addObject(seed))
+            } else {
+              AERPeaCase.recordAborted(this)
+            }
+          } else {
+            val fruit = PlantReproduction.createFruit(
+              this.parentPlant.getPlantType(), parent1Chromosomes, parent2Chromosomes
+            )
+            fruit.foreach { item =>
+              if (AERPeaCase.isActive) AERPeaCase.recordFruitSet(this, item)
+              this.getContainer().get.addObject(item)
+            }
           }
 
           // Delete flower

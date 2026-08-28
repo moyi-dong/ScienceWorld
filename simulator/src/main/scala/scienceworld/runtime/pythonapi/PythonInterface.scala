@@ -172,6 +172,47 @@ class PythonInterface() {
     return worldName + ":" + caseRoot
   }
 
+  def configureAERPeaCase(worldName:String, caseRoot:Int, preferenceWeight:Double):String = {
+    AERPeaCase.configureWorld(worldName, caseRoot, preferenceWeight)
+    return worldName + ":" + caseRoot + ":" + preferenceWeight
+  }
+
+  def configureAERPeaCase(
+    worldName:String,
+    caseRoot:Int,
+    preferenceWeight:Double,
+    growthNoise:Int,
+    flowerCountNoise:Int,
+    fruitTimingNoise:Int
+  ):String = {
+    AERPeaCase.configureWorld(
+      worldName,
+      caseRoot,
+      preferenceWeight,
+      growthNoise,
+      flowerCountNoise,
+      fruitTimingNoise
+    )
+    return worldName + ":" + caseRoot + ":" + preferenceWeight + ":" +
+      growthNoise + ":" + flowerCountNoise + ":" + fruitTimingNoise
+  }
+
+  def configureAERPeaCaseV04(
+    worldName:String,
+    caseRoot:Int,
+    preferenceWeight:Double,
+    soilNutrientNoise:Int,
+    fruitSetNoise:Int,
+    contaminationNoise:Int
+  ):String = {
+    AERPeaCase.configureWorldV04(
+      worldName, caseRoot, preferenceWeight,
+      soilNutrientNoise, fruitSetNoise, contaminationNoise
+    )
+    return worldName + ":" + caseRoot + ":" + preferenceWeight + ":v0.4:" +
+      soilNutrientNoise + ":" + fruitSetNoise + ":" + contaminationNoise
+  }
+
   def getAERPeaCaseEventsJSON():String = AERPeaCase.eventsJSON
 
   def getAERPeaCaseReproductionEventsJSON():String = AERPeaCase.reproductionEventsJSON
@@ -179,6 +220,44 @@ class PythonInterface() {
   def getAERPeaCaseSummaryJSON():String = AERPeaCase.summaryJSON
 
   def getAERPeaCaseWorldsJSON():String = AERPeaCase.supportedWorldsJSON
+
+  def getAERPeaCasePublicStatusJSON():String = {
+    if (agentInterface.isEmpty) return "{\"episode_tick\":0,\"pots\":[]}"
+    AERPeaCase.publicStatusJSON(agentInterface.get.universe)
+  }
+
+  def batchWaterAERPeaCaseJSON(targetNames:java.util.List[String]):String = {
+    if (agentInterface.isEmpty) return "{\"ok\":false,\"error\":\"environment is not loaded\"}"
+    AERPeaCase.batchWaterJSON(agentInterface.get.universe, targetNames.asScala.toArray)
+  }
+
+  def batchSowAERPeaCaseJSON(
+    seedIds:java.util.List[String],
+    targetNames:java.util.List[String]
+  ):String = {
+    if (agentInterface.isEmpty) return "{\"ok\":false,\"error\":\"environment is not loaded\"}"
+    AERPeaCase.batchSowJSON(
+      agentInterface.get.universe,
+      seedIds.asScala.toArray,
+      targetNames.asScala.toArray
+    )
+  }
+
+  def controlledCrossAERPeaCaseJSON(
+    recipientPots:java.util.List[String],
+    donorPots:java.util.List[String],
+    emasculatedFlags:java.util.List[java.lang.Boolean],
+    baggedFlags:java.util.List[java.lang.Boolean]
+  ):String = {
+    if (agentInterface.isEmpty) return "{\"ok\":false,\"error\":\"environment is not loaded\"}"
+    AERPeaCase.controlledCrossJSON(
+      agentInterface.get.universe,
+      recipientPots.asScala.toArray,
+      donorPots.asScala.toArray,
+      emasculatedFlags.asScala.map(_.booleanValue()).toArray,
+      baggedFlags.asScala.map(_.booleanValue()).toArray
+    )
+  }
 
 
   /*

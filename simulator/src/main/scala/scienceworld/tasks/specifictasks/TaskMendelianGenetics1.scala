@@ -10,7 +10,7 @@ import scienceworld.tasks.goals.{Goal, GoalSequence}
 import scienceworld.tasks.goals.specificgoals.{GoalContainerOpen, GoalFind, GoalFindInclinedPlaneNamed, GoalInRoomWithObject, GoalLifeStageAnywhere, GoalMoveToLocation, GoalMoveToNewLocation, GoalSpecificObjectInDirectContainer}
 import TaskMendelianGenetics1._
 import scienceworld.actions.Action
-import scienceworld.aer.AERFlowerColorSleeve
+import scienceworld.aer.{AERFlowerColorSleeve, AERPeaCase}
 import scienceworld.goldagent.PathFinder
 import scienceworld.objects.containers.furniture.BeeHive
 import scienceworld.objects.containers.{CeramicCup, FlowerPot, Jug, SelfWateringFlowerPot}
@@ -82,7 +82,9 @@ class TaskMendelianGenetics1(val mode:String = MODE_MENDEL_KNOWN) extends TaskPa
 
     for (i <- 0 until 5) {      // 5 different variations of pot names
       val out = new ArrayBuffer[TaskModifier]()
-      val pots = TaskMendelianGenetics1.mkFlowerPots(numPots = 6)
+      val pots = TaskMendelianGenetics1.mkFlowerPots(
+        numPots = AERPeaCase.flowerPotCountForTask(isAERMode)
+      )
       var potNames = new ArrayBuffer[String]
       for (pot <- pots) {
         out.append(new TaskObject(pot.name, Some(pot), roomToGenerateIn = location, Array.empty[String], generateNear = 0, forceAdd = false))
@@ -687,7 +689,10 @@ object TaskMendelianGenetics1 {
 
   // Make N flower pots
   def mkFlowerPots(numPots:Int): Array[EnvObject] = {
-    val maxIdx = 10
+    // Preserve the frozen six-pot protocol's original 1..9 name pool exactly.
+    // The v0.4 development protocol requests 20 pots, which requires a larger
+    // pool rather than merely slicing 20 items from the legacy nine-item pool.
+    val maxIdx = Math.max(10, numPots + 1)
 
     // Make N uniquely-named flower pots
     val pots = new ArrayBuffer[EnvObject]()

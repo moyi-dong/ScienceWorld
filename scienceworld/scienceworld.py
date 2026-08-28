@@ -1,7 +1,8 @@
-from typing import List, Dict, Tuple, Set, Any
+from typing import List, Dict, Tuple, Set, Any, Optional
 from typing import OrderedDict as OrderedDictType
 import json
 import logging
+import math
 import tempfile
 from collections import OrderedDict
 from os.path import join as pjoin
@@ -195,7 +196,11 @@ class ScienceWorldEnv:
         return self.server.getTaskMaxVariations(infer_task(task_name))
 
     def configure_aer_pea_case(
-        self, world_name: str = "white_preference", case_root: int = 0
+        self,
+        world_name: str = "white_preference",
+        case_root: int = 0,
+        preference_weight: Optional[float] = None,
+        noise_levels: Optional[Dict[str, str]] = None,
     ) -> str:
         """Configure the hidden AER pea world before loading or resetting it.
 
@@ -204,7 +209,53 @@ class ScienceWorldEnv:
         """
         if isinstance(case_root, bool) or not isinstance(case_root, int) or case_root < 0:
             raise ValueError("case_root must be a non-negative integer")
-        return self.server.configureAERPeaCase(world_name, case_root)
+        if noise_levels is None and preference_weight is None:
+            return self.server.configureAERPeaCase(world_name, case_root)
+        if preference_weight is not None:
+            if (
+                isinstance(preference_weight, bool)
+                or not isinstance(preference_weight, (int, float))
+                or not math.isfinite(preference_weight)
+                or preference_weight < 1.0
+            ):
+                raise ValueError("preference_weight must be finite and at least 1.0")
+        effective_preference_weight = 9.0 if preference_weight is None else float(preference_weight)
+        if noise_levels is None:
+            return self.server.configureAERPeaCase(
+                world_name, case_root, effective_preference_weight
+            )
+        if not isinstance(noise_levels, dict):
+            raise ValueError("noise_levels must be a mapping")
+        v04_noise_keys = {
+            "soil_nutrient_lot",
+            "fruit_set_success",
+            "cross_parentage_contamination",
+        }
+        legacy_noise_keys = {"growth_timing", "flower_count", "fruit_timing"}
+        provided_noise_keys = frozenset(noise_levels)
+        if provided_noise_keys not in {frozenset(v04_noise_keys), frozenset(legacy_noise_keys)}:
+            raise ValueError(
+                "noise_levels must contain soil_nutrient_lot, fruit_set_success, and "
+                "cross_parentage_contamination"
+            )
+        level_ids = {"none": 0, "weak": 1, "medium": 2, "strong": 3}
+        if any(value not in level_ids for value in noise_levels.values()):
+            raise ValueError("noise levels must be none, weak, medium, or strong")
+        keys = (
+            ("soil_nutrient_lot", "fruit_set_success", "cross_parentage_contamination")
+            if set(noise_levels) == v04_noise_keys
+            else ("growth_timing", "flower_count", "fruit_timing")
+        )
+        configure = (
+            self.server.configureAERPeaCaseV04
+            if set(noise_levels) == v04_noise_keys
+            else self.server.configureAERPeaCase
+        )
+        return configure(
+            world_name, case_root, effective_preference_weight,
+            level_ids[noise_levels[keys[0]]], level_ids[noise_levels[keys[1]]],
+            level_ids[noise_levels[keys[2]]],
+        )
 
     def get_aer_pea_case_events(self) -> List[Dict[str, Any]]:
         """Return lossless AER events for deterministic grading and tests."""
@@ -221,6 +272,48 @@ class ScienceWorldEnv:
     def get_aer_pea_case_worlds(self) -> List[str]:
         """Return the hidden AER pea worlds supported by this build."""
         return json.loads(self.server.getAERPeaCaseWorldsJSON())
+
+    def get_aer_pea_case_public_status(self) -> Dict[str, Any]:
+        """Return only solver-observable pot and growth status."""
+        return json.loads(self.server.getAERPeaCasePublicStatusJSON())
+
+    def batch_water_aer_pea_case(self, target_names: List[str]) -> Dict[str, Any]:
+        """Apply one operator-owned batch watering mutation."""
+        java_targets = self._gateway.jvm.java.util.ArrayList()
+        for target_name in target_names:
+            java_targets.add(target_name)
+        return json.loads(self.server.batchWaterAERPeaCaseJSON(java_targets))
+
+    def batch_sow_aer_pea_case(
+        self, seed_ids: List[str], target_names: List[str]
+    ) -> Dict[str, Any]:
+        """Move explicitly selected public seed IDs into explicitly selected pots."""
+        java_seed_ids = self._gateway.jvm.java.util.ArrayList()
+        java_targets = self._gateway.jvm.java.util.ArrayList()
+        for seed_id in seed_ids:
+            java_seed_ids.add(seed_id)
+        for target_name in target_names:
+            java_targets.add(target_name)
+        return json.loads(
+            self.server.batchSowAERPeaCaseJSON(java_seed_ids, java_targets)
+        )
+
+    def controlled_cross_aer_pea_case(self, crosses: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Apply explicit recipient/donor controlled crosses through the operator bridge."""
+        recipients = self._gateway.jvm.java.util.ArrayList()
+        donors = self._gateway.jvm.java.util.ArrayList()
+        emasculated = self._gateway.jvm.java.util.ArrayList()
+        bagged = self._gateway.jvm.java.util.ArrayList()
+        for cross in crosses:
+            recipients.add(cross["recipient_pot"])
+            donors.add(cross["pollen_pot"])
+            emasculated.add(bool(cross["emasculated"]))
+            bagged.add(bool(cross["bagged"]))
+        return json.loads(
+            self.server.controlledCrossAERPeaCaseJSON(
+                recipients, donors, emasculated, bagged
+            )
+        )
 
     # Get possible actions
     def get_possible_actions(self) -> List[str]:

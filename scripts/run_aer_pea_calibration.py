@@ -122,6 +122,8 @@ def _validate_split(
 class EpisodeService:
     """Own one hidden world while exposing only the native public interaction surface."""
 
+    note_mechanisms = NOTE_MECHANISMS
+
     def __init__(
         self,
         world: str,
@@ -131,9 +133,10 @@ class EpisodeService:
         operator_window_path: Path,
         step_limit: int,
         matched_pre_exposure: bool = False,
+        noise_levels: dict[str, str] | None = None,
     ) -> None:
         self.env = ScienceWorldEnv("", serverPath=None, envStepLimit=step_limit)
-        self.env.configure_aer_pea_case(world, case_root)
+        self.env.configure_aer_pea_case(world, case_root, noise_levels=noise_levels)
         self.env.load(TASK, variation, "easy", generateGoldPath=matched_pre_exposure)
         self.trajectory_path = trajectory_path
         self.operator_window_path = operator_window_path
@@ -266,7 +269,7 @@ class EpisodeService:
                 return {"ok": False, "error": "phase must be investigation or validation"}
             if raw_record.get("probe_kind") not in PROBE_KINDS:
                 return {"ok": False, "error": "unsupported probe_kind"}
-            if raw_record.get("hypothesis") not in NOTE_MECHANISMS:
+            if raw_record.get("hypothesis") not in self.note_mechanisms:
                 return {"ok": False, "error": "unsupported hypothesis"}
             if not isinstance(raw_record.get("prediction"), str) or not raw_record["prediction"]:
                 return {"ok": False, "error": "prediction must be a non-empty string"}

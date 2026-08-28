@@ -30,7 +30,7 @@ class PlantLifeStageSeed(obj:Plant, lifecycle:LifeCycle) extends LifeStage(Plant
       return
     }
 
-    ticksMeetingCriteria += 1
+    ticksMeetingCriteria += AERPeaCase.growthStepIncrement(obj, PlantLifeStages.PLANT_STAGE_SEED)
     if (ticksMeetingCriteria >= stageDuration) {
       println ("* Plant (" + obj.name + " / " + this.stageName + "): Criteria met: (ticks: " + ticksMeetingCriteria + ")")
       // Consume the water (delete it from the simulation)
@@ -118,7 +118,7 @@ class PlantLifeStageSeedling(obj:Plant, lifecycle:LifeCycle) extends LifeStage(P
     // Don't continue to life stage progression if stressed
     if (stressed) return
 
-    ticksMeetingCriteria += 1
+    ticksMeetingCriteria += AERPeaCase.growthStepIncrement(obj, PlantLifeStages.PLANT_STAGE_SEEDLING)
     if (ticksMeetingCriteria >= stageDuration) {
       // Consume the water (delete it from the simulation)
       objWater.get.delete()
@@ -203,7 +203,7 @@ class PlantLifeStageAdult(obj:Plant, lifecycle:LifeCycle) extends LifeStage(Plan
     // Don't continue to life stage progression if stressed
     if (stressed) return
 
-    ticksMeetingCriteria += 1
+    ticksMeetingCriteria += AERPeaCase.growthStepIncrement(obj, PlantLifeStages.PLANT_STAGE_ADULT_PLANT)
     if (ticksMeetingCriteria >= stageDuration) {
 
       // Move onto next stage
@@ -287,13 +287,13 @@ class PlantLifeStageReproduction(obj:Plant, lifecycle:LifeCycle) extends LifeSta
     // Don't continue to life stage progression if stressed
     if (stressed) return
 
-    ticksMeetingCriteria += 1
+    ticksMeetingCriteria += AERPeaCase.growthStepIncrement(obj, PlantLifeStages.PLANT_STAGE_REPRODUCING)
     if (ticksMeetingCriteria >= stageDuration) {
-      val maxFlowers = AERPeaCase.maxFlowersPerPlant
+      val maxFlowers = AERPeaCase.maxFlowersPerPlant(obj)
 
       // Create a flower
       val existingFlowers = obj.getContainedObjectsOfType[Flower]()
-      if (existingFlowers.size < maxFlowers) {
+      if (existingFlowers.size < maxFlowers && AERPeaCase.canCreateFlower(obj)) {
         val flower = new Flower(parentPlant = obj)
         obj.addObject(flower)
       }

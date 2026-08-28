@@ -21,6 +21,7 @@ SUPPORTED_WORLDS = {
     "position_attraction",
     "plant_attractiveness",
     "fertility_difference",
+    "cross_direction_delay",
     "transient_null",
     "clean",
 }
@@ -29,6 +30,7 @@ EXPECTED_MECHANISMS = {
     "position_attraction": "flower_pot_position",
     "plant_attractiveness": "plant_identity",
     "fertility_difference": "post_pollination_fruit_set_speed",
+    "cross_direction_delay": "cross_direction_fruit_set_delay",
     "transient_null": "selected_uniform_null_root",
     "clean": "uniform_flower_choice",
 }
@@ -222,6 +224,40 @@ def test_operator_case_roots_are_validated_and_replay_independently():
             root_events[case_root] = first_events
 
         assert root_events[DEV_ROOTS[0]] != root_events[DEV_ROOTS[1]]
+    finally:
+        env.close()
+
+
+def test_operator_can_version_preference_strength_without_changing_legacy_default():
+    env = ScienceWorldEnv("", serverPath=None, envStepLimit=10_000)
+    try:
+        for invalid in (True, 0.5, float("inf"), float("nan")):
+            with pytest.raises(ValueError, match="finite and at least 1.0"):
+                env.configure_aer_pea_case(
+                    "white_preference", DEV_ROOTS[0], preference_weight=invalid
+                )
+
+        _, parent_actions, _ = _gold_and_parent_actions(env)
+        summaries = {}
+        events = {}
+        for label, weight in (("legacy", None), ("two_to_one", 2.0)):
+            env.configure_aer_pea_case(
+                "white_preference", DEV_ROOTS[0], preference_weight=weight
+            )
+            env.load(TASK, 0, "easy", generateGoldPath=False)
+            _run_actions(env, parent_actions)
+            summaries[label] = env.get_aer_pea_case_summary()
+            events[label] = env.get_aer_pea_case_events()
+
+        assert summaries["legacy"]["preference_weight"] == 9.0
+        assert summaries["two_to_one"]["preference_weight"] == 2.0
+        assert events["legacy"] != events["two_to_one"]
+
+        env.configure_aer_pea_case("white_preference", DEV_ROOTS[0], 2.0)
+        env.load(TASK, 0, "easy", generateGoldPath=False)
+        _run_actions(env, parent_actions)
+        assert env.get_aer_pea_case_summary() == summaries["two_to_one"]
+        assert env.get_aer_pea_case_events() == events["two_to_one"]
     finally:
         env.close()
 
