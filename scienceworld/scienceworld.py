@@ -261,6 +261,52 @@ class ScienceWorldEnv:
         """Return lossless AER events for deterministic grading and tests."""
         return json.loads(self.server.getAERPeaCaseEventsJSON())
 
+    def configure_aer_pea_replay_branch(
+        self,
+        world_name: str,
+        replay_seed: int,
+        preference_weight: float = 9.0,
+        noise_levels: Optional[Dict[str, str]] = None,
+    ) -> str:
+        """Branch a loaded AER pea episode for operator-only differential replay.
+
+        The physical pre-action state and public history are preserved.  Only the future
+        mechanism/noise profile and AER random streams are replaced.  This method must never
+        be exposed by a solver-facing wrapper.
+        """
+        if isinstance(replay_seed, bool) or not isinstance(replay_seed, int) or replay_seed < 0:
+            raise ValueError("replay_seed must be a non-negative integer")
+        if (
+            isinstance(preference_weight, bool)
+            or not isinstance(preference_weight, (int, float))
+            or not math.isfinite(preference_weight)
+            or preference_weight < 1.0
+        ):
+            raise ValueError("preference_weight must be finite and at least 1.0")
+        expected = {
+            "soil_nutrient_lot",
+            "fruit_set_success",
+            "cross_parentage_contamination",
+        }
+        if noise_levels is None:
+            noise_levels = {name: "none" for name in expected}
+        if not isinstance(noise_levels, dict) or set(noise_levels) != expected:
+            raise ValueError(
+                "noise_levels must contain soil_nutrient_lot, fruit_set_success, and "
+                "cross_parentage_contamination"
+            )
+        level_ids = {"none": 0, "weak": 1, "medium": 2, "strong": 3}
+        if any(value not in level_ids for value in noise_levels.values()):
+            raise ValueError("noise levels must be none, weak, medium, or strong")
+        return self.server.configureAERPeaCaseReplayBranchV04(
+            world_name,
+            replay_seed,
+            float(preference_weight),
+            level_ids[noise_levels["soil_nutrient_lot"]],
+            level_ids[noise_levels["fruit_set_success"]],
+            level_ids[noise_levels["cross_parentage_contamination"]],
+        )
+
     def get_aer_pea_case_summary(self) -> Dict[str, Any]:
         """Return an operator-facing summary of comparable flower visits."""
         return json.loads(self.server.getAERPeaCaseSummaryJSON())

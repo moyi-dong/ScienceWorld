@@ -24,14 +24,16 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 from collections.abc import Iterator
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 SCRIPT_PATH = Path(__file__).resolve()
 SCIENCEWORLD_ROOT = SCRIPT_PATH.parents[1]
 ROOT = SCRIPT_PATH.parents[3]
+sys.path.insert(0, str(SCRIPT_PATH.parent))
 sys.path.insert(0, str(SCIENCEWORLD_ROOT))
 sys.path.insert(0, str(ROOT / "src"))
 
@@ -41,17 +43,23 @@ from jsonschema import Draft202012Validator  # noqa: E402
 
 from aer_bench.codex_app_server import (  # noqa: E402
     CodexAppServer,
+    CodexAppServerError,
     TurnResult,
     session_inventory,
 )
 from aer_bench.codex_runner import CodexRunConfig, CodexRunner  # noqa: E402
 from aer_bench.pea_handoff_v06 import (  # noqa: E402
+    ComparisonProfile,
     aggregate,
+    aggregate_v064,
     read_json,
     score_task,
     sha256_json,
     sha256_path,
+    sha256_tree,
     validate_contracts,
+    validate_model_comparison_contract,
+    validate_repeat_run_contract,
     write_json,
 )
 
@@ -63,6 +71,8 @@ MATRIX_PATH = CONSTRUCTION / "hidden-configuration-matrix.v0.5-development.json"
 TASKS_PATH = CONSTRUCTION / "formulation-task-matrix.v0.6-development.json"
 CONSTRUCTION_PATH = CONSTRUCTION / "handoff-construction.v0.6-development.json"
 EVALUATION_PATH = CONSTRUCTION / "evaluation-contract.v0.6-development.json"
+REPEAT_RUN_PATH = CONSTRUCTION / "repeat-run-contract.v0.6.3-development.json"
+MODEL_COMPARISON_PATH = CONSTRUCTION / "model-comparison-contract.v0.6.4-development.json"
 BUILDER_SCHEMA_PATH = CONSTRUCTION / "handoff-builder-output.schema.v0.6-development.json"
 BUILDER_SCHEDULE_PATH = CONSTRUCTION / "handoff-builder-schedule.v0.6-development.json"
 REVIEW_RUBRIC_PATH = CONSTRUCTION / "handoff-review-rubric.v0.6-development.json"
@@ -72,13 +82,29 @@ P4_SCHEMA_PATH = PUBLIC / "evaluation-output.schema.v0.5.1-development.json"
 MAIN_SCHEMA_PATH = PUBLIC / "submission.schema.json"
 CLIENT_PATH = PUBLIC / "lab.py"
 MECHANISM_GOLD_PATH = HIDDEN / "mechanism-gold.v0.5.1-development.json"
-FORMULATION_PATH = Path(
+DEFAULT_FORMULATION_PATH = Path(
     "/Users/yrmac/Documents/Obsidian Vault/Research&Engineer/AER-Bench/Formulation.md"
 )
+FORMULATION_PATH = DEFAULT_FORMULATION_PATH
 MODEL = "gpt-5.6-sol"
 REASONING_EFFORT = "high"
 FAST_MODE = False
 DEFAULT_OUTPUT = SCIENCEWORLD_ROOT / "artifacts/aer_pea_case/handoff-v0.6-development-0001"
+
+
+@dataclass(frozen=True)
+class LegacyRuntimeProfile:
+    """The unchanged v0.6.3 Sol profile used when no comparison group is requested."""
+
+    group: str = "sol_v063"
+    main_model: str = MODEL
+    probe_model: str = MODEL
+    reasoning_effort: str = REASONING_EFFORT
+    fast_mode: bool = FAST_MODE
+    prompt_tier: str = "v0.6.3-frozen-native-handoff"
+
+
+RuntimeProfile = ComparisonProfile | LegacyRuntimeProfile
 
 
 def _configure_java_runtime() -> Path:
@@ -128,7 +154,271 @@ def _safe_text(path: Path, value: str) -> None:
     temporary.replace(path)
 
 
-def _load_contracts() -> tuple[
+def _known_bound_paths() -> dict[str, Path]:
+    return {
+        "task_matrix": TASKS_PATH,
+        "evaluation_contract": EVALUATION_PATH,
+        "configuration_matrix": MATRIX_PATH,
+        "mechanism_gold": MECHANISM_GOLD_PATH,
+        "main_schema": MAIN_SCHEMA_PATH,
+        "probe_schema": PROBE_SCHEMA_PATH,
+        "p4_schema": P4_SCHEMA_PATH,
+        "lab_client": CLIENT_PATH,
+        "scienceworld_jar": SCIENCEWORLD_ROOT / "scienceworld/scienceworld.jar",
+    }
+
+
+def _bound_paths(contract: dict[str, Any]) -> dict[str, Path]:
+    known = _known_bound_paths()
+    names = set(contract.get("bound_inputs", {}))
+    unknown = names - set(known)
+    if unknown:
+        raise ValueError(f"v0.6 contract names unknown bound inputs: {sorted(unknown)}")
+    return {name: known[name] for name in names}
+
+
+def _comparison_prompts(evaluation: dict[str, Any]) -> dict[str, str]:
+    return {
+        "checkpoint": evaluation["handoff_checkpoint"]["prompt"],
+        "exploration": evaluation["prompts"]["exploration"],
+        "main": _main_prompt(),
+        "P1": evaluation["prompts"]["P1"],
+        "P2": evaluation["prompts"]["P2"],
+        "P4": evaluation["prompts"]["P4"],
+    }
+
+
+def _runtime_profile(
+    *, output_root: Path, comparison_group: str | None, handoff_root: Path | None = None
+) -> RuntimeProfile:
+    formulation_path = _resolved_formulation_path()
+    root = handoff_root if handoff_root is not None else output_root / "handoffs"
+    if comparison_group is None:
+        repeat_contract = read_json(REPEAT_RUN_PATH)
+        validate_repeat_run_contract(
+            repeat_contract,
+            formulation_path=formulation_path,
+            handoff_root=root,
+            bound_paths=_bound_paths(repeat_contract),
+        )
+        return LegacyRuntimeProfile()
+
+    contract = read_json(MODEL_COMPARISON_PATH)
+    group_spec = contract.get("comparison_groups", {}).get(comparison_group)
+    if not isinstance(group_spec, dict):
+        raise ValueError(f"unknown v0.6.4 comparison group: {comparison_group}")
+    evaluation = read_json(EVALUATION_PATH)
+    return validate_model_comparison_contract(
+        contract,
+        group=comparison_group,
+        main_model=group_spec.get("main_model"),
+        probe_model=group_spec.get("probe_model"),
+        reasoning_effort=group_spec.get("reasoning_effort"),
+        fast_mode=group_spec.get("fast_mode"),
+        prompt_tier=group_spec.get("prompt_tier"),
+        formulation_path=formulation_path,
+        handoff_root=root,
+        bound_paths=_bound_paths(contract),
+        prompts=_comparison_prompts(evaluation),
+    )
+
+
+def _resolved_formulation_path(path: Path | None = None) -> Path:
+    resolved = (FORMULATION_PATH if path is None else path).expanduser().resolve()
+    if not resolved.is_file():
+        raise ValueError(f"formulation source is not a file: {resolved}")
+    return resolved
+
+
+def _formulation_source(contract: dict[str, Any]) -> dict[str, str]:
+    path = _resolved_formulation_path()
+    digest = sha256_path(path)
+    if digest != contract.get("formulation_sha256"):
+        raise ValueError("Formulation.md changed after the v0.6.4 contract was frozen")
+    return {"path": str(path), "sha256": digest}
+
+
+def _profile_metadata(profile: RuntimeProfile) -> dict[str, Any]:
+    comparison = isinstance(profile, ComparisonProfile)
+    contract_path = MODEL_COMPARISON_PATH if comparison else REPEAT_RUN_PATH
+    contract = read_json(contract_path)
+    source = contract["source_handoffs"]
+    metadata = {
+        "comparison_group": profile.group,
+        "main_model": profile.main_model,
+        "probe_model": profile.probe_model,
+        "reasoning_effort": profile.reasoning_effort,
+        "fast_mode": profile.fast_mode,
+        "service_tier": None,
+        "prompt_tier": profile.prompt_tier,
+        "contract": {
+            "path": str(contract_path.relative_to(ROOT)),
+            "sha256": sha256_path(contract_path),
+        },
+        "handoff_source": {
+            "path": source["path"],
+            "file_count": source["file_count"],
+            "tree_sha256": source["tree_sha256"],
+        },
+    }
+    if comparison:
+        metadata["formulation_source"] = _formulation_source(contract)
+    return metadata
+
+
+def _validate_profile_record(
+    record: dict[str, Any], profile: RuntimeProfile, *, label: str
+) -> None:
+    if not isinstance(record, dict):
+        raise ValueError(f"{label} is not a JSON object")
+    expected = _profile_metadata(profile)
+    keys = (
+        "comparison_group",
+        "main_model",
+        "probe_model",
+        "reasoning_effort",
+        "fast_mode",
+        "service_tier",
+        "prompt_tier",
+        "contract",
+        "handoff_source",
+    )
+    if isinstance(profile, ComparisonProfile):
+        keys += ("formulation_source",)
+    for key in keys:
+        if record.get(key) != expected[key]:
+            raise ValueError(f"{label} has a mismatched v0.6 runtime profile field: {key}")
+
+
+def _validate_summary_profile_records(
+    run_summary: dict[str, Any],
+    evaluation_summary: dict[str, Any],
+    profile: RuntimeProfile,
+) -> None:
+    """Bind group-level summaries to the same immutable comparison profile."""
+
+    if not isinstance(profile, ComparisonProfile):
+        return
+    _validate_profile_record(run_summary, profile, label="run summary")
+    for key in ("provenance", "study"):
+        value = evaluation_summary.get(key)
+        if not isinstance(value, dict):
+            raise ValueError(f"evaluation summary has no {key} profile")
+        _validate_profile_record(value, profile, label=f"evaluation summary {key}")
+
+
+def _comparison_profiles(contract: dict[str, Any]) -> list[ComparisonProfile]:
+    groups = contract.get("comparison_groups")
+    if not isinstance(groups, dict) or not groups:
+        raise ValueError("v0.6.4 comparison group registry is missing")
+    profiles = []
+    for group, value in groups.items():
+        if not isinstance(group, str) or not isinstance(value, dict):
+            raise ValueError("v0.6.4 comparison group registry is malformed")
+        try:
+            profiles.append(ComparisonProfile(group=group, **value))
+        except TypeError as error:
+            raise ValueError(
+                f"v0.6.4 comparison group profile is malformed: {group}"
+            ) from error
+    return profiles
+
+
+def _validate_model_preflight_result(
+    result: dict[str, Any], profiles: list[ComparisonProfile]
+) -> None:
+    """Reject a cached model catalog unless it proves every exact registered profile."""
+
+    expected_header = {
+        "schema_version": "aer.pea.model-preflight.v0.6.4-development",
+        "status": "complete",
+        "contract_sha256": sha256_path(MODEL_COMPARISON_PATH),
+        "requested_reasoning_effort": "high",
+        "fast_mode": False,
+        "service_tier": None,
+        "fallback_model_used": False,
+        "model_list_model_turns": 0,
+        "formulation_source": _formulation_source(read_json(MODEL_COMPARISON_PATH)),
+    }
+    for key, expected in expected_header.items():
+        if result.get(key) != expected:
+            raise ValueError(f"cached model/list preflight has an invalid field: {key}")
+    selected = result.get("selected_models")
+    expected_groups = {profile.group for profile in profiles}
+    if not isinstance(selected, dict) or set(selected) != expected_groups:
+        raise ValueError("cached model/list preflight has an invalid comparison-group set")
+    for profile in profiles:
+        value = selected.get(profile.group)
+        if not isinstance(value, dict):
+            raise ValueError(f"cached model/list preflight is malformed: {profile.group}")
+        efforts = value.get("supported_reasoning_efforts")
+        if (
+            value.get("model") != profile.main_model
+            or value.get("high_supported") is not True
+            or not isinstance(efforts, list)
+            or "high" not in efforts
+        ):
+            raise ValueError(
+                f"cached model/list preflight does not prove the profile: {profile.group}"
+            )
+
+
+def _validate_actual_thread_profiles(
+    profiles: dict[str, Any],
+    profile: RuntimeProfile,
+    *,
+    label: str,
+    expected_thread_ids: set[str] | None = None,
+) -> None:
+    if not isinstance(profiles, dict) or not profiles:
+        raise ValueError(f"{label} has no validated actual thread profiles")
+    if expected_thread_ids is not None and set(profiles) != expected_thread_ids:
+        raise ValueError(f"{label} has an unexpected actual thread-profile set")
+    for thread_id, value in profiles.items():
+        if not isinstance(thread_id, str) or not isinstance(value, dict):
+            raise ValueError(f"{label} has malformed actual thread profiles")
+        effort = value.get("reasoning_effort")
+        if (
+            value.get("model") != profile.main_model
+            or effort not in {None, profile.reasoning_effort}
+            or value.get("fast_mode") is not False
+            or value.get("service_tier") is not None
+            or value.get("profile_validated") is not True
+        ):
+            raise ValueError(f"{label} has a mismatched actual thread profile: {thread_id}")
+
+
+def _validate_prepared_group_manifest(
+    manifest: dict[str, Any], profile: ComparisonProfile, output_root: Path
+) -> None:
+    _validate_profile_record(manifest, profile, label="comparison group manifest")
+    if (
+        manifest.get("schema_version")
+        != "aer.pea.comparison-group-manifest.v0.6.4-development"
+        or manifest.get("status") != "prepared"
+        or manifest.get("construct_new_handoffs") is not False
+    ):
+        raise ValueError("comparison group manifest is not a prepared v0.6.4 root")
+    clone = manifest.get("handoff_clone")
+    destination = output_root / "handoffs"
+    source = _profile_metadata(profile)["handoff_source"]
+    if (
+        not isinstance(clone, dict)
+        or clone.get("path") != str(destination)
+        or clone.get("file_count") != source["file_count"]
+        or clone.get("tree_sha256") != source["tree_sha256"]
+    ):
+        raise ValueError("comparison group manifest has an invalid handoff clone")
+    if sha256_tree(destination) != clone["tree_sha256"]:
+        raise ValueError("comparison group manifest does not match the restored handoff tree")
+
+
+def _load_contracts(
+    *,
+    output_root: Path | None = None,
+    repeat_run: bool = False,
+    comparison_group: str | None = None,
+) -> tuple[
     dict[str, Any],
     dict[str, Any],
     dict[str, Any],
@@ -140,8 +430,26 @@ def _load_contracts() -> tuple[
     tasks = read_json(TASKS_PATH)
     construction = read_json(CONSTRUCTION_PATH)
     evaluation = read_json(EVALUATION_PATH)
+    accepted_formulation_sha256 = None
+    if repeat_run:
+        if output_root is None:
+            raise ValueError("repeat-run validation requires an output root")
+        profile = _runtime_profile(
+            output_root=output_root, comparison_group=comparison_group
+        )
+        contract_path = (
+            MODEL_COMPARISON_PATH
+            if isinstance(profile, ComparisonProfile)
+            else REPEAT_RUN_PATH
+        )
+        accepted_formulation_sha256 = read_json(contract_path)["formulation_sha256"]
     configurations, task_index = validate_contracts(
-        construction, tasks, evaluation, matrix, FORMULATION_PATH
+        construction,
+        tasks,
+        evaluation,
+        matrix,
+        FORMULATION_PATH,
+        accepted_formulation_sha256=accepted_formulation_sha256,
     )
     Draft202012Validator.check_schema(read_json(BUILDER_SCHEMA_PATH))
     Draft202012Validator.check_schema(read_json(REVIEW_SCHEMA_PATH))
@@ -1096,6 +1404,71 @@ def _turn_payload(turn: TurnResult) -> dict[str, Any]:
     return asdict(turn)
 
 
+def _turn_from_payload(payload: dict[str, Any]) -> TurnResult:
+    try:
+        turn = TurnResult(**payload)
+    except (TypeError, ValueError) as error:
+        raise ValueError("saved turn payload is malformed") from error
+    if not isinstance(turn.thread_id, str) or not isinstance(turn.turn_id, str):
+        raise ValueError("saved turn payload has invalid native identifiers")
+    return turn
+
+
+def _probe_stage_payload(
+    *,
+    probe: str,
+    turn: TurnResult,
+    profile: RuntimeProfile,
+    task_id: str,
+    actual_thread_profile: dict[str, Any] | None,
+) -> dict[str, Any]:
+    return {
+        "schema_version": "aer.pea.probe-stage.v0.6.4-development",
+        "status": "preserved",
+        "task_id": task_id,
+        "probe": probe,
+        **_profile_metadata(profile),
+        "actual_thread_profile": actual_thread_profile,
+        "turn": _turn_payload(turn),
+    }
+
+
+def _load_probe_stage(
+    path: Path,
+    *,
+    probe: str,
+    profile: RuntimeProfile,
+    task_id: str,
+    expected_thread_id: str,
+) -> tuple[TurnResult, dict[str, Any] | None]:
+    payload = read_json(path)
+    actual_thread_profile: dict[str, Any] | None = None
+    if isinstance(profile, ComparisonProfile):
+        _validate_profile_record(payload, profile, label=f"cached {probe} stage {task_id}")
+        if (
+            payload.get("schema_version") != "aer.pea.probe-stage.v0.6.4-development"
+            or payload.get("status") != "preserved"
+            or payload.get("task_id") != task_id
+            or payload.get("probe") != probe
+            or not isinstance(payload.get("turn"), dict)
+        ):
+            raise ValueError(f"cached {probe} stage {task_id} is malformed")
+        turn_payload = payload["turn"]
+        actual_thread_profile = payload.get("actual_thread_profile")
+        _validate_actual_thread_profiles(
+            {expected_thread_id: actual_thread_profile},
+            profile,
+            label=f"cached {probe} stage {task_id}",
+            expected_thread_ids={expected_thread_id},
+        )
+    else:
+        turn_payload = payload.get("turn", payload)
+    turn = _turn_from_payload(turn_payload)
+    if turn.thread_id != expected_thread_id:
+        raise ValueError(f"cached {probe} stage {task_id} belongs to another native thread")
+    return turn, actual_thread_profile
+
+
 def _handoff_context(packet: dict[str, Any], exploration_prompt: str) -> str:
     return v05._handoff_context(packet, exploration_prompt)
 
@@ -1111,8 +1484,318 @@ def _main_prompt() -> str:
     )
 
 
-def run_task(output_root: Path, task_id: str, timeout: int) -> dict[str, Any]:
-    _, _, _, evaluation, configurations, tasks = _load_contracts()
+def prepare_comparison_group(output_root: Path, comparison_group: str) -> dict[str, Any]:
+    """Restore the exact frozen handoff tree and lock one output root to one model group."""
+
+    contract = read_json(MODEL_COMPARISON_PATH)
+    source = ROOT / contract["source_handoffs"]["path"]
+    profile = _runtime_profile(
+        output_root=output_root,
+        comparison_group=comparison_group,
+        handoff_root=source,
+    )
+    output_root.mkdir(parents=True, exist_ok=True)
+    manifest_path = output_root / "comparison_group_manifest.json"
+    if manifest_path.is_file():
+        manifest = read_json(manifest_path)
+        _runtime_profile(output_root=output_root, comparison_group=comparison_group)
+        _validate_prepared_group_manifest(manifest, profile, output_root)
+        return manifest
+
+    destination = output_root / "handoffs"
+    if destination.exists():
+        if not destination.is_dir():
+            raise ValueError(f"comparison handoff destination is not a directory: {destination}")
+    else:
+        temporary = output_root / "handoffs.tmp"
+        if temporary.exists():
+            raise ValueError(f"stale comparison handoff staging tree: {temporary}")
+        shutil.copytree(source, temporary, copy_function=shutil.copy2)
+        temporary.replace(destination)
+    copied_profile = _runtime_profile(
+        output_root=output_root,
+        comparison_group=comparison_group,
+    )
+    if copied_profile != profile:
+        raise RuntimeError("comparison profile changed while restoring frozen handoffs")
+    metadata = _profile_metadata(profile)
+    manifest = {
+        "schema_version": "aer.pea.comparison-group-manifest.v0.6.4-development",
+        "status": "prepared",
+        **metadata,
+        "prepared_at_unix": time.time(),
+        "handoff_clone": {
+            "path": str(destination),
+            "file_count": sum(item.is_file() for item in destination.rglob("*")),
+            "tree_sha256": sha256_tree(destination),
+        },
+        "construct_new_handoffs": False,
+    }
+    write_json(manifest_path, manifest)
+    _validate_prepared_group_manifest(manifest, profile, output_root)
+    return manifest
+
+
+def preflight_models(output_root: Path) -> dict[str, Any]:
+    """Use the official model catalog to prove every registered group supports ``high``."""
+
+    contract = read_json(MODEL_COMPARISON_PATH)
+    profiles = _comparison_profiles(contract)
+    for profile in profiles:
+        validated = _runtime_profile(
+            output_root=output_root, comparison_group=profile.group
+        )
+        if validated != profile:
+            raise RuntimeError(f"comparison profile changed during preflight: {profile.group}")
+    result_path = output_root / "model_preflight.json"
+    if result_path.is_file():
+        result = read_json(result_path)
+        if result.get("status") != "complete":
+            raise RuntimeError("the preserved model/list preflight is infrastructure-blocked")
+        _validate_model_preflight_result(result, profiles)
+        return result
+
+    preflight_root = output_root / "model-preflight"
+    workspace = preflight_root / "workspace"
+    workspace.mkdir(parents=True, exist_ok=False)
+    started = time.time()
+    result: dict[str, Any]
+    try:
+        with CodexAppServer(
+            codex_home=preflight_root / "codex-home",
+            artifact_dir=preflight_root / "app-server",
+            workspace=workspace,
+            model=profiles[0].main_model,
+            reasoning_effort="high",
+            socket_path=None,
+            fast_mode=False,
+        ) as app:
+            catalog = app.list_models(include_hidden=True)
+        selected: dict[str, dict[str, Any]] = {}
+        failures = []
+        for profile in profiles:
+            matches = [
+                item
+                for item in catalog
+                if item.get("model") == profile.main_model
+            ]
+            efforts = {
+                option.get("reasoningEffort")
+                for item in matches
+                for option in item.get("supportedReasoningEfforts", [])
+                if isinstance(option, dict)
+            }
+            if len(matches) != 1 or "high" not in efforts:
+                failures.append(profile.main_model)
+            else:
+                item = matches[0]
+                selected[profile.group] = {
+                    "id": item.get("id"),
+                    "model": item.get("model"),
+                    "hidden": item.get("hidden"),
+                    "supported_reasoning_efforts": sorted(value for value in efforts if value),
+                    "high_supported": True,
+                }
+        if failures:
+            raise RuntimeError(
+                "registered models are missing or do not support high: " + ", ".join(failures)
+            )
+        result = {
+            "schema_version": "aer.pea.model-preflight.v0.6.4-development",
+            "status": "complete",
+            "contract_sha256": sha256_path(MODEL_COMPARISON_PATH),
+            "requested_reasoning_effort": "high",
+            "fast_mode": False,
+            "service_tier": None,
+            "fallback_model_used": False,
+            "selected_models": selected,
+            "catalog_sha256": sha256_json(catalog),
+            "model_list_model_turns": 0,
+            "formulation_source": _formulation_source(contract),
+            "started_at_unix": started,
+            "finished_at_unix": time.time(),
+        }
+    except Exception as error:
+        result = {
+            "schema_version": "aer.pea.model-preflight.v0.6.4-development",
+            "status": "infrastructure_blocked",
+            "contract_sha256": sha256_path(MODEL_COMPARISON_PATH),
+            "requested_reasoning_effort": "high",
+            "fast_mode": False,
+            "service_tier": None,
+            "fallback_model_used": False,
+            "formulation_source": _formulation_source(contract),
+            "error": f"{type(error).__name__}: {error}",
+            "started_at_unix": started,
+            "finished_at_unix": time.time(),
+        }
+        write_json(result_path, result)
+        raise
+    write_json(result_path, result)
+    _validate_model_preflight_result(result, profiles)
+    return result
+
+
+def _require_comparison_ready(output_root: Path, profile: RuntimeProfile) -> None:
+    if not isinstance(profile, ComparisonProfile):
+        return
+    manifest = read_json(output_root / "comparison_group_manifest.json")
+    _validate_prepared_group_manifest(manifest, profile, output_root)
+    preflight = read_json(output_root / "model_preflight.json")
+    _validate_model_preflight_result(
+        preflight, _comparison_profiles(read_json(MODEL_COMPARISON_PATH))
+    )
+
+
+def _run_turn_starts_below(root: Path) -> int:
+    return sum(
+        row.get("direction") == "outbound"
+        and row.get("message", {}).get("method") == "turn/start"
+        for path in root.rglob("app_server_rpc.jsonl")
+        for row in _json_lines(path)
+    )
+
+
+def _validate_cached_run_manifest(
+    manifest: dict[str, Any], profile: RuntimeProfile, task_id: str
+) -> None:
+    if not isinstance(profile, ComparisonProfile):
+        return
+    _validate_profile_record(manifest, profile, label=f"cached run {task_id}")
+    if (
+        manifest.get("schema_version")
+        != "aer.pea.handoff-main-run.v0.6.4-development"
+        or manifest.get("task_id") != task_id
+        or manifest.get("model") != profile.main_model
+        or manifest.get("main_attempt") != 1
+        or manifest.get("evaluation_executed_during_run") is not False
+    ):
+        raise ValueError(f"cached run {task_id} is not a valid v0.6.4 main archive")
+    threads = manifest.get("threads")
+    if not isinstance(threads, dict):
+        raise ValueError(f"cached run {task_id} has no registered fork tree")
+    expected_thread_ids = {
+        threads.get("parent_thread_id"),
+        threads.get("P1_thread_id"),
+        threads.get("P2_thread_id"),
+        threads.get("main_thread_id"),
+        threads.get("P4_thread_id"),
+    }
+    if None in expected_thread_ids or len(expected_thread_ids) != 5:
+        raise ValueError(f"cached run {task_id} has an invalid registered fork tree")
+    _validate_actual_thread_profiles(
+        manifest.get("actual_thread_profiles"),
+        profile,
+        label=f"cached run {task_id}",
+        expected_thread_ids=expected_thread_ids,
+    )
+
+
+def _run_failure_is_infrastructure(error: Exception) -> bool:
+    return isinstance(
+        error,
+        (
+            CodexAppServerError,
+            ConnectionError,
+            OSError,
+            TimeoutError,
+        ),
+    )
+
+
+def _record_run_failure(
+    run_root: Path,
+    *,
+    task_id: str,
+    profile: RuntimeProfile,
+    error: Exception,
+) -> None:
+    if not run_root.is_dir():
+        return
+    turn_starts = _run_turn_starts_below(run_root)
+    infrastructure = _run_failure_is_infrastructure(error)
+    write_json(
+        run_root / "run_failure.json",
+        {
+            "schema_version": "aer.pea.main-run-failure.v0.6.4-development",
+            "status": "infrastructure_failure" if infrastructure else "preserved_failure",
+            "task_id": task_id,
+            **_profile_metadata(profile),
+            "model_turn_starts": turn_starts,
+            "retry_allowed": infrastructure and turn_starts == 0,
+            "error": f"{type(error).__name__}: {error}",
+            "failed_at_unix": time.time(),
+        },
+    )
+
+
+def _archive_zero_turn_run_failure(
+    output_root: Path,
+    *,
+    task_id: str,
+    profile: RuntimeProfile,
+) -> None:
+    run_root = output_root / "runs" / task_id
+    if not run_root.exists():
+        return
+    failure_path = run_root / "run_failure.json"
+    state_path = run_root / "run_attempt_state.json"
+    evidence_path = failure_path if failure_path.is_file() else state_path
+    if not evidence_path.is_file():
+        raise RuntimeError(
+            f"incomplete run {task_id} has no failure/state record; refusing to overwrite it"
+        )
+    evidence = read_json(evidence_path)
+    _validate_profile_record(evidence, profile, label=f"incomplete run {task_id}")
+    actual_turn_starts = _run_turn_starts_below(run_root)
+    if failure_path.is_file():
+        if evidence.get("retry_allowed") is not True:
+            raise RuntimeError(f"preserved run failure for {task_id} is not retryable")
+        if evidence.get("model_turn_starts") != actual_turn_starts:
+            raise RuntimeError(f"run failure turn accounting changed for {task_id}")
+    elif evidence.get("status") != "running":
+        raise RuntimeError(f"incomplete run state for {task_id} is not recoverable")
+    if actual_turn_starts != 0:
+        raise RuntimeError(
+            f"incomplete run {task_id} already started {actual_turn_starts} model turn(s); "
+            "retry would violate the fixed 100-turn contract"
+        )
+
+    archive_root = output_root / "run-infrastructure-attempts" / task_id
+    archive_root.mkdir(parents=True, exist_ok=True)
+    existing = sorted(archive_root.glob("attempt-*"))
+    destination = archive_root / f"attempt-{len(existing) + 1:02d}"
+    if destination.exists():
+        raise RuntimeError(f"run failure archive already exists: {destination}")
+    run_root.rename(destination)
+    write_json(
+        destination / "recovery.json",
+        {
+            "schema_version": "aer.pea.main-run-recovery.v0.6.4-development",
+            "status": "archived_before_zero-turn_retry",
+            "task_id": task_id,
+            **_profile_metadata(profile),
+            "model_turn_starts": 0,
+            "archived_at_unix": time.time(),
+        },
+    )
+
+
+def _run_task_once(
+    output_root: Path,
+    task_id: str,
+    timeout: int,
+    comparison_group: str | None = None,
+) -> dict[str, Any]:
+    _, _, _, evaluation, configurations, tasks = _load_contracts(
+        output_root=output_root,
+        repeat_run=True,
+        comparison_group=comparison_group,
+    )
+    profile = _runtime_profile(
+        output_root=output_root, comparison_group=comparison_group
+    )
+    _require_comparison_ready(output_root, profile)
     task = tasks[task_id]
     configuration = configurations[task["configuration_id"]]
     handoff_root = output_root / "handoffs" / task_id
@@ -1126,8 +1809,21 @@ def run_task(output_root: Path, task_id: str, timeout: int) -> dict[str, Any]:
     run_root = output_root / "runs" / task_id
     manifest_path = run_root / "run_manifest.json"
     if manifest_path.is_file():
-        return read_json(manifest_path)
+        manifest = read_json(manifest_path)
+        _validate_cached_run_manifest(manifest, profile, task_id)
+        return manifest
+    started_at_unix = time.time()
     run_root.mkdir(parents=True, exist_ok=False)
+    write_json(
+        run_root / "run_attempt_state.json",
+        {
+            "schema_version": "aer.pea.main-run-attempt.v0.6.4-development",
+            "status": "running",
+            "task_id": task_id,
+            **_profile_metadata(profile),
+            "started_at_unix": started_at_unix,
+        },
+    )
     workspace = run_root / "workspace"
     workspace.mkdir()
     shutil.copy2(CLIENT_PATH, workspace / "lab.py")
@@ -1140,6 +1836,8 @@ def run_task(output_root: Path, task_id: str, timeout: int) -> dict[str, Any]:
     main_turn: TurnResult | None = None
     thread_manifest: dict[str, Any] = {}
     hidden_summary: dict[str, Any] = {}
+    actual_thread_profiles: dict[str, dict[str, Any]] = {}
+    stage_timings: dict[str, dict[str, float]] = {}
     try:
         replayed = v05._replay_recipe(service, recipe)
         replay_payload = v05._semantic_payload(service, replayed, task)
@@ -1162,12 +1860,14 @@ def run_task(output_root: Path, task_id: str, timeout: int) -> dict[str, Any]:
                     codex_home=run_root / "codex-home",
                     artifact_dir=run_root / "app-server-run",
                     workspace=workspace,
-                    model=MODEL,
-                    reasoning_effort=REASONING_EFFORT,
+                    model=profile.main_model,
+                    reasoning_effort=profile.reasoning_effort,
                     socket_path=socket_path,
+                    fast_mode=profile.fast_mode,
                 ) as app,
             ):
                 parent_thread = app.start_thread(developer_instructions=context)
+                checkpoint_started = time.time()
                 checkpoint = app.run_turn(
                     thread_id=parent_thread,
                     prompt=evaluation["handoff_checkpoint"]["prompt"],
@@ -1180,6 +1880,10 @@ def run_task(output_root: Path, task_id: str, timeout: int) -> dict[str, Any]:
                     or checkpoint.errors
                 ):
                     raise RuntimeError(f"handoff checkpoint failed: {_turn_payload(checkpoint)}")
+                stage_timings["checkpoint"] = {
+                    "started_at_unix": checkpoint_started,
+                    "finished_at_unix": time.time(),
+                }
                 p1_thread = app.fork_thread(
                     parent_thread, last_turn_id=checkpoint.turn_id, read_only=True
                 )
@@ -1189,6 +1893,7 @@ def run_task(output_root: Path, task_id: str, timeout: int) -> dict[str, Any]:
                 main_thread = app.fork_thread(
                     parent_thread, last_turn_id=checkpoint.turn_id, read_only=False
                 )
+                main_started = time.time()
                 main_turn = app.run_turn(
                     thread_id=main_thread,
                     prompt=_main_prompt(),
@@ -1198,6 +1903,11 @@ def run_task(output_root: Path, task_id: str, timeout: int) -> dict[str, Any]:
                 p4_thread = app.fork_thread(
                     main_thread, last_turn_id=main_turn.turn_id, read_only=True
                 )
+                stage_timings["main"] = {
+                    "started_at_unix": main_started,
+                    "finished_at_unix": time.time(),
+                }
+                actual_thread_profiles = dict(app.thread_profiles)
                 thread_manifest = {
                     "parent_thread_id": parent_thread,
                     "checkpoint_turn_id": checkpoint.turn_id,
@@ -1222,6 +1932,19 @@ def run_task(output_root: Path, task_id: str, timeout: int) -> dict[str, Any]:
     operator_path = run_root / "environment/operator_action_windows.jsonl"
     if not checkpoint or not main_turn:
         raise RuntimeError(f"run did not establish the registered fork tree for {task_id}")
+    expected_thread_ids = {
+        thread_manifest["parent_thread_id"],
+        thread_manifest["P1_thread_id"],
+        thread_manifest["P2_thread_id"],
+        thread_manifest["main_thread_id"],
+        thread_manifest["P4_thread_id"],
+    }
+    _validate_actual_thread_profiles(
+        actual_thread_profiles,
+        profile,
+        label=f"main run {task_id}",
+        expected_thread_ids=expected_thread_ids,
+    )
     solver_rows = [row for row in _json_lines(trajectory_path) if row.get("source") == "solver"]
     if (run_root / "app-server-run/app_server_rpc.jsonl").is_file():
         # Keep a normalized model/tool view in addition to the complete raw RPC stream.
@@ -1237,19 +1960,31 @@ def run_task(output_root: Path, task_id: str, timeout: int) -> dict[str, Any]:
             },
         )
     manifest = {
-        "schema_version": "aer.pea.handoff-main-run.v0.6-development",
+        "schema_version": (
+            "aer.pea.handoff-main-run.v0.6.4-development"
+            if isinstance(profile, ComparisonProfile)
+            else "aer.pea.handoff-main-run.v0.6-development"
+        ),
         "status": "completed" if main_turn.status == "completed" else main_turn.status,
         "task_id": task_id,
         "configuration_id": configuration["id"],
         "surface": task["surface"],
-        "model": MODEL,
-        "reasoning_effort": REASONING_EFFORT,
-        "fast_mode": FAST_MODE,
+        "model": profile.main_model,
+        **_profile_metadata(profile),
         "main_attempt": 1,
+        "task_handoff": {
+            "manifest_sha256": sha256_path(handoff_root / "handoff_manifest.json"),
+            "replay_recipe_sha256": sha256_path(handoff_root / "replay_recipe.json"),
+            "solver_visible_handoff_sha256": sha256_path(
+                handoff_root / "solver_visible_handoff.json"
+            ),
+        },
         "handoff_context_sha256": hashlib.sha256(context.encode()).hexdigest(),
+        "prompt_sha256": hashlib.sha256(_main_prompt().encode()).hexdigest(),
         "checkpoint": _turn_payload(checkpoint),
         "main": _turn_payload(main_turn),
         "threads": thread_manifest,
+        "actual_thread_profiles": actual_thread_profiles,
         "environment_completed": service.completed,
         "solver_public_tool_event_count": len(solver_rows),
         "public_trajectory_sha256": sha256_path(trajectory_path),
@@ -1257,31 +1992,103 @@ def run_task(output_root: Path, task_id: str, timeout: int) -> dict[str, Any]:
         "session_inventory": session_inventory(run_root / "codex-home"),
         "credential_archived": (run_root / "codex-home/auth.json").exists(),
         "evaluation_executed_during_run": False,
+        "stage_timings": stage_timings,
+        "started_at_unix": started_at_unix,
+        "finished_at_unix": time.time(),
     }
+    manifest["duration_seconds"] = (
+        manifest["finished_at_unix"] - manifest["started_at_unix"]
+    )
     write_json(manifest_path, manifest)
+    state = read_json(run_root / "run_attempt_state.json")
+    state["status"] = "completed"
+    state["finished_at_unix"] = manifest["finished_at_unix"]
+    state["model_turn_starts"] = _run_turn_starts_below(run_root)
+    write_json(run_root / "run_attempt_state.json", state)
     return manifest
 
 
-def run_study(output_root: Path, task_ids: list[str] | None, timeout: int) -> dict[str, Any]:
-    _, _, _, _, _, tasks = _load_contracts()
+def run_task(
+    output_root: Path,
+    task_id: str,
+    timeout: int,
+    comparison_group: str | None = None,
+) -> dict[str, Any]:
+    """Run one Task, preserving failures and retrying only a zero-turn infrastructure start."""
+
+    profile = _runtime_profile(
+        output_root=output_root, comparison_group=comparison_group
+    )
+    _require_comparison_ready(output_root, profile)
+    manifest_path = output_root / "runs" / task_id / "run_manifest.json"
+    if manifest_path.is_file():
+        manifest = read_json(manifest_path)
+        _validate_cached_run_manifest(manifest, profile, task_id)
+        return manifest
+    _archive_zero_turn_run_failure(
+        output_root,
+        task_id=task_id,
+        profile=profile,
+    )
+    try:
+        return _run_task_once(output_root, task_id, timeout, comparison_group)
+    except Exception as error:
+        _record_run_failure(
+            output_root / "runs" / task_id,
+            task_id=task_id,
+            profile=profile,
+            error=error,
+        )
+        raise
+
+
+def run_study(
+    output_root: Path,
+    task_ids: list[str] | None,
+    timeout: int,
+    comparison_group: str | None = None,
+) -> dict[str, Any]:
+    profile = _runtime_profile(
+        output_root=output_root, comparison_group=comparison_group
+    )
+    if isinstance(profile, ComparisonProfile) and not (
+        output_root / "model_preflight.json"
+    ).is_file():
+        preflight_models(output_root)
+    _require_comparison_ready(output_root, profile)
+    _, _, _, _, _, tasks = _load_contracts(
+        output_root=output_root,
+        repeat_run=True,
+        comparison_group=comparison_group,
+    )
     selected = task_ids or list(tasks)
     unknown = sorted(set(selected) - set(tasks))
     if unknown:
         raise ValueError(f"unknown Task IDs: {unknown}")
+    started_at_unix = time.time()
     results = []
     for task_id in selected:
         print(f"RUN {task_id}", flush=True)
-        results.append(run_task(output_root, task_id, timeout))
+        results.append(run_task(output_root, task_id, timeout, comparison_group))
         write_json(output_root / "run_partial.json", results)
+    finished_at_unix = time.time()
     summary = {
-        "schema_version": "aer.pea.handoff-run-summary.v0.6-development",
+        "schema_version": (
+            "aer.pea.handoff-run-summary.v0.6.4-development"
+            if isinstance(profile, ComparisonProfile)
+            else "aer.pea.handoff-run-summary.v0.6-development"
+        ),
         "status": "complete" if len(results) == len(tasks) else "partial",
         "task_count": len(results),
-        "model": MODEL,
-        "reasoning_effort": REASONING_EFFORT,
-        "fast_mode": FAST_MODE,
+        "model": profile.main_model,
+        **_profile_metadata(profile),
         "main_attempts_per_task": 1,
         "evaluation_executed": False,
+        "main_archive_count": len(results),
+        "expected_main_archive_count": len(tasks),
+        "started_at_unix": started_at_unix,
+        "finished_at_unix": finished_at_unix,
+        "duration_seconds": finished_at_unix - started_at_unix,
         "results": results,
     }
     write_json(output_root / "run_summary.json", summary)
@@ -1307,50 +2114,228 @@ def _run_saved_probe(
     )
 
 
-def evaluate_task(output_root: Path, task_id: str, timeout: int) -> dict[str, Any]:
-    _, _, _, evaluation, configurations, tasks = _load_contracts()
+def _probe_turn_start_count(evaluation_root: Path) -> int:
+    return _turn_start_count_many(
+        sorted(evaluation_root.glob("app-server-evaluation-attempt-*/app_server_rpc.jsonl"))
+    )
+
+
+def _require_safe_probe_resume(evaluation_root: Path, completed_probe_count: int) -> None:
+    turn_starts = _probe_turn_start_count(evaluation_root)
+    if turn_starts != completed_probe_count:
+        raise RuntimeError(
+            "probe recovery would violate fixed turn accounting: "
+            f"{turn_starts} turn/start records but {completed_probe_count} preserved stages"
+        )
+
+
+def _validate_cached_evaluation_result(
+    result: dict[str, Any], profile: RuntimeProfile, task_id: str
+) -> None:
+    if not isinstance(profile, ComparisonProfile):
+        return
+    _validate_profile_record(result, profile, label=f"cached evaluation {task_id}")
+    if (
+        result.get("schema_version")
+        != "aer.pea.handoff-task-evaluation.v0.6.4-development"
+        or result.get("status") != "complete"
+        or result.get("task_id") != task_id
+        or result.get("model") != profile.probe_model
+        or result.get("scienceworld_started") is not False
+        or result.get("native_saved_threads_resumed") is not True
+    ):
+        raise ValueError(f"cached evaluation {task_id} is not a valid v0.6.4 archive")
+    expected_thread_ids = set()
+    for probe in ("P1", "P2", "P4"):
+        payload = result.get(probe)
+        if not isinstance(payload, dict):
+            raise ValueError(f"cached evaluation {task_id} has no {probe} turn")
+        turn = _turn_from_payload(payload)
+        expected_thread_ids.add(turn.thread_id)
+    if len(expected_thread_ids) != 3:
+        raise ValueError(f"cached evaluation {task_id} reused a probe thread")
+    _validate_actual_thread_profiles(
+        result.get("actual_thread_profiles"),
+        profile,
+        label=f"cached evaluation {task_id}",
+        expected_thread_ids=expected_thread_ids,
+    )
+
+
+def evaluate_task(
+    output_root: Path,
+    task_id: str,
+    timeout: int,
+    comparison_group: str | None = None,
+) -> dict[str, Any]:
+    _, _, _, evaluation, configurations, tasks = _load_contracts(
+        output_root=output_root,
+        repeat_run=True,
+        comparison_group=comparison_group,
+    )
+    profile = _runtime_profile(
+        output_root=output_root, comparison_group=comparison_group
+    )
+    _require_comparison_ready(output_root, profile)
     task = tasks[task_id]
     configuration = configurations[task["configuration_id"]]
     run_root = output_root / "runs" / task_id
     run_manifest = read_json(run_root / "run_manifest.json")
+    _validate_cached_run_manifest(run_manifest, profile, task_id)
     if run_manifest.get("evaluation_executed_during_run") is not False:
         raise RuntimeError("run/evaluate separation contract is not satisfied")
     evaluation_root = output_root / "evaluation" / task_id
     result_path = evaluation_root / "evaluation_result.json"
     if result_path.is_file():
-        return read_json(result_path)
-    evaluation_root.mkdir(parents=True, exist_ok=False)
+        result = read_json(result_path)
+        _validate_cached_evaluation_result(result, profile, task_id)
+        if isinstance(profile, ComparisonProfile):
+            _require_safe_probe_resume(evaluation_root, 3)
+        return result
+    started_at_unix = time.time()
+    evaluation_root.mkdir(parents=True, exist_ok=True)
     master = read_json(PROBE_SCHEMA_PATH)
     threads = run_manifest["threads"]
-    with CodexAppServer(
-        codex_home=run_root / "codex-home",
-        artifact_dir=evaluation_root / "app-server-evaluation",
-        workspace=run_root / "workspace",
-        model=MODEL,
-        reasoning_effort=REASONING_EFFORT,
-        socket_path=None,
-    ) as app:
-        p1 = _run_saved_probe(
-            app=app,
-            thread_id=threads["P1_thread_id"],
-            prompt=evaluation["prompts"]["P1"],
-            schema=_schema_for(master, "P1"),
-            timeout=timeout,
+    specifications = {
+        "P1": (
+            threads["P1_thread_id"],
+            evaluation["prompts"]["P1"],
+            _schema_for(master, "P1"),
+        ),
+        "P2": (
+            threads["P2_thread_id"],
+            evaluation["prompts"]["P2"],
+            _schema_for(master, "P2"),
+        ),
+        "P4": (
+            threads["P4_thread_id"],
+            evaluation["prompts"]["P4"],
+            read_json(P4_SCHEMA_PATH),
+        ),
+    }
+    turns: dict[str, TurnResult] = {}
+    stage_thread_profiles: dict[str, dict[str, Any]] = {}
+    for probe in specifications:
+        stage_path = evaluation_root / f"{probe}.turn.json"
+        if stage_path.is_file():
+            thread_id = specifications[probe][0]
+            turn, thread_profile = _load_probe_stage(
+                stage_path,
+                probe=probe,
+                profile=profile,
+                task_id=task_id,
+                expected_thread_id=thread_id,
+            )
+            turns[probe] = turn
+            if thread_profile is not None:
+                stage_thread_profiles[thread_id] = thread_profile
+
+    progress_path = evaluation_root / "probe_progress.json"
+    if progress_path.is_file():
+        progress = read_json(progress_path)
+        if isinstance(profile, ComparisonProfile):
+            _validate_profile_record(progress, profile, label=f"probe progress {task_id}")
+            if (
+                progress.get("schema_version")
+                != "aer.pea.probe-progress.v0.6.4-development"
+                or progress.get("task_id") != task_id
+            ):
+                raise ValueError(f"probe progress {task_id} is malformed")
+    else:
+        progress = {
+            "schema_version": "aer.pea.probe-progress.v0.6.4-development",
+            "status": "running",
+            "task_id": task_id,
+            **_profile_metadata(profile),
+            "completed_probes": [],
+            "probe_timings": {},
+            "actual_thread_profiles": {},
+        }
+    if not isinstance(progress.get("probe_timings"), dict) or not isinstance(
+        progress.get("actual_thread_profiles"), dict
+    ):
+        raise ValueError(f"probe progress {task_id} has malformed evidence fields")
+    progress["actual_thread_profiles"].update(stage_thread_profiles)
+    progress["completed_probes"] = [
+        name for name in specifications if name in turns
+    ]
+    missing = [probe for probe in specifications if probe not in turns]
+    if missing:
+        if isinstance(profile, ComparisonProfile):
+            _require_safe_probe_resume(evaluation_root, len(turns))
+        attempts = sorted(evaluation_root.glob("app-server-evaluation-attempt-*"))
+        attempt_number = len(attempts) + 1
+        artifact_dir = evaluation_root / f"app-server-evaluation-attempt-{attempt_number:02d}"
+        try:
+            with CodexAppServer(
+                codex_home=run_root / "codex-home",
+                artifact_dir=artifact_dir,
+                workspace=run_root / "workspace",
+                model=profile.probe_model,
+                reasoning_effort=profile.reasoning_effort,
+                socket_path=None,
+                fast_mode=profile.fast_mode,
+            ) as app:
+                for probe in missing:
+                    thread_id, prompt, schema = specifications[probe]
+                    probe_started = time.time()
+                    turn = _run_saved_probe(
+                        app=app,
+                        thread_id=thread_id,
+                        prompt=prompt,
+                        schema=schema,
+                        timeout=timeout,
+                    )
+                    turns[probe] = turn
+                    actual_profiles = app.thread_profiles
+                    thread_profile = actual_profiles.get(thread_id)
+                    write_json(
+                        evaluation_root / f"{probe}.turn.json",
+                        _probe_stage_payload(
+                            probe=probe,
+                            turn=turn,
+                            profile=profile,
+                            task_id=task_id,
+                            actual_thread_profile=thread_profile,
+                        ),
+                    )
+                    probe_finished = time.time()
+                    progress["probe_timings"][probe] = {
+                        "started_at_unix": probe_started,
+                        "finished_at_unix": probe_finished,
+                        "duration_seconds": probe_finished - probe_started,
+                    }
+                    progress["completed_probes"] = [
+                        name for name in specifications if name in turns
+                    ]
+                    progress["actual_thread_profiles"].update(actual_profiles)
+                    write_json(progress_path, progress)
+        except Exception as error:
+            write_json(
+                evaluation_root / f"infrastructure_failure_attempt_{attempt_number:02d}.json",
+                {
+                    "status": "infrastructure_failure",
+                    **_profile_metadata(profile),
+                    "completed_probes_preserved": [
+                        probe for probe in specifications if probe in turns
+                    ],
+                    "failed_at_unix": time.time(),
+                    "error": f"{type(error).__name__}: {error}",
+                },
+            )
+            raise
+    if isinstance(profile, ComparisonProfile):
+        _require_safe_probe_resume(evaluation_root, 3)
+        expected_probe_threads = {
+            specifications[probe][0] for probe in ("P1", "P2", "P4")
+        }
+        _validate_actual_thread_profiles(
+            progress["actual_thread_profiles"],
+            profile,
+            label=f"probe evaluation {task_id}",
+            expected_thread_ids=expected_probe_threads,
         )
-        p2 = _run_saved_probe(
-            app=app,
-            thread_id=threads["P2_thread_id"],
-            prompt=evaluation["prompts"]["P2"],
-            schema=_schema_for(master, "P2"),
-            timeout=timeout,
-        )
-        p4 = _run_saved_probe(
-            app=app,
-            thread_id=threads["P4_thread_id"],
-            prompt=evaluation["prompts"]["P4"],
-            schema=read_json(P4_SCHEMA_PATH),
-            timeout=timeout,
-        )
+    p1, p2, p4 = (turns[probe] for probe in ("P1", "P2", "P4"))
     gold = read_json(MECHANISM_GOLD_PATH)["gold"]
     row = score_task(
         task=task,
@@ -1361,12 +2346,15 @@ def evaluate_task(output_root: Path, task_id: str, timeout: int) -> dict[str, An
         p4=p4.output,
     )
     result = {
-        "schema_version": "aer.pea.handoff-task-evaluation.v0.6-development",
+        "schema_version": (
+            "aer.pea.handoff-task-evaluation.v0.6.4-development"
+            if isinstance(profile, ComparisonProfile)
+            else "aer.pea.handoff-task-evaluation.v0.6-development"
+        ),
         "status": "complete",
         "task_id": task_id,
-        "model": MODEL,
-        "reasoning_effort": REASONING_EFFORT,
-        "fast_mode": FAST_MODE,
+        "model": profile.probe_model,
+        **_profile_metadata(profile),
         "scienceworld_started": False,
         "run_process_reused": False,
         "native_saved_threads_resumed": True,
@@ -1374,38 +2362,200 @@ def evaluate_task(output_root: Path, task_id: str, timeout: int) -> dict[str, An
         "P2": _turn_payload(p2),
         "P4": _turn_payload(p4),
         "score": row,
+        "probe_timings": progress["probe_timings"],
+        "actual_thread_profiles": progress["actual_thread_profiles"],
         "session_inventory_after_evaluation": session_inventory(run_root / "codex-home"),
         "credential_archived": (run_root / "codex-home/auth.json").exists(),
+        "started_at_unix": started_at_unix,
+        "finished_at_unix": time.time(),
     }
+    result["duration_seconds"] = result["finished_at_unix"] - result["started_at_unix"]
     write_json(result_path, result)
+    progress["status"] = "complete"
+    progress["finished_at_unix"] = result["finished_at_unix"]
+    write_json(progress_path, progress)
     return result
 
 
-def evaluate_study(output_root: Path, task_ids: list[str] | None, timeout: int) -> dict[str, Any]:
-    _, _, _, _, _, tasks = _load_contracts()
+def evaluate_study(
+    output_root: Path,
+    task_ids: list[str] | None,
+    timeout: int,
+    comparison_group: str | None = None,
+) -> dict[str, Any]:
+    profile = _runtime_profile(
+        output_root=output_root, comparison_group=comparison_group
+    )
+    _require_comparison_ready(output_root, profile)
+    _, _, _, _, _, tasks = _load_contracts(
+        output_root=output_root,
+        repeat_run=True,
+        comparison_group=comparison_group,
+    )
     selected = task_ids or list(tasks)
     unknown = sorted(set(selected) - set(tasks))
     if unknown:
         raise ValueError(f"unknown Task IDs: {unknown}")
+    started_at_unix = time.time()
     results = []
     rows = []
     for task_id in selected:
         print(f"EVALUATE {task_id}", flush=True)
-        result = evaluate_task(output_root, task_id, timeout)
+        result = evaluate_task(output_root, task_id, timeout, comparison_group)
         results.append(result)
         rows.append(result["score"])
         write_json(output_root / "evaluation_partial.json", results)
-    summary = aggregate(rows)
+    if isinstance(profile, ComparisonProfile):
+        summary = aggregate_v064(
+            rows,
+            provenance={
+                **_profile_metadata(profile),
+                "source": "structured P1/P2/P4 outputs",
+            },
+        )
+    else:
+        summary = aggregate(rows)
+    finished_at_unix = time.time()
     summary["study"] = {
-        "model": MODEL,
-        "reasoning_effort": REASONING_EFFORT,
-        "fast_mode": FAST_MODE,
+        "model": profile.probe_model,
+        **_profile_metadata(profile),
         "task_ids": selected,
         "scienceworld_started_during_evaluation": False,
         "native_saved_threads_resumed": True,
+        "completed_main_count": sum(
+            (output_root / f"runs/{task_id}/run_manifest.json").is_file()
+            for task_id in selected
+        ),
+        "completed_probe_counts": {
+            probe: sum(result.get(probe) is not None for result in results)
+            for probe in ("P1", "P2", "P4")
+        },
+        "started_at_unix": started_at_unix,
+        "finished_at_unix": finished_at_unix,
+        "duration_seconds": finished_at_unix - started_at_unix,
     }
     write_json(output_root / "evaluation_summary.json", summary)
+    if isinstance(profile, ComparisonProfile):
+        write_json(
+            output_root / "evaluation_summary.v0.6.4-development.json",
+            summary,
+        )
     return summary
+
+
+def _validated_worker_id(worker_id: str) -> str:
+    allowed = set("abcdefghijklmnopqrstuvwxyz0123456789-_.")
+    if (
+        not worker_id
+        or worker_id[0] not in allowed - {"-", "_", "."}
+        or any(character not in allowed for character in worker_id)
+    ):
+        raise ValueError(f"invalid worker id: {worker_id!r}")
+    return worker_id
+
+
+def _worker_task_ids(
+    output_root: Path,
+    task_ids: list[str] | None,
+    comparison_group: str | None,
+) -> tuple[ComparisonProfile, list[str]]:
+    profile = _runtime_profile(
+        output_root=output_root, comparison_group=comparison_group
+    )
+    if not isinstance(profile, ComparisonProfile):
+        raise ValueError("parallel workers are available only for v0.6.4 comparison groups")
+    _require_comparison_ready(output_root, profile)
+    if not task_ids:
+        raise ValueError("parallel workers require an explicit non-empty Task shard")
+    if len(task_ids) != len(set(task_ids)):
+        raise ValueError("parallel worker Task shards may not contain duplicates")
+    _, _, _, _, _, tasks = _load_contracts(
+        output_root=output_root,
+        repeat_run=True,
+        comparison_group=comparison_group,
+    )
+    unknown = sorted(set(task_ids) - set(tasks))
+    if unknown:
+        raise ValueError(f"unknown Task IDs: {unknown}")
+    return profile, task_ids
+
+
+def run_worker(
+    output_root: Path,
+    task_ids: list[str] | None,
+    timeout: int,
+    comparison_group: str | None,
+    worker_id: str,
+) -> dict[str, Any]:
+    """Run one disjoint main-phase Task shard without racing the group summary files."""
+
+    worker_id = _validated_worker_id(worker_id)
+    profile, selected = _worker_task_ids(output_root, task_ids, comparison_group)
+    started_at_unix = time.time()
+    completed: list[str] = []
+    worker_path = output_root / "run_workers" / f"{worker_id}.json"
+    for task_id in selected:
+        print(f"RUN-WORKER {worker_id} {task_id}", flush=True)
+        run_task(output_root, task_id, timeout, comparison_group)
+        completed.append(task_id)
+        write_json(
+            worker_path,
+            {
+                "schema_version": "aer.pea.main-run-worker.v0.6.4-development",
+                "status": "running",
+                "worker_id": worker_id,
+                **_profile_metadata(profile),
+                "task_ids": selected,
+                "completed_task_ids": completed,
+                "started_at_unix": started_at_unix,
+                "updated_at_unix": time.time(),
+            },
+        )
+    result = read_json(worker_path)
+    result["status"] = "complete"
+    result["finished_at_unix"] = time.time()
+    result["duration_seconds"] = result["finished_at_unix"] - started_at_unix
+    write_json(worker_path, result)
+    return result
+
+
+def evaluate_worker(
+    output_root: Path,
+    task_ids: list[str] | None,
+    timeout: int,
+    comparison_group: str | None,
+    worker_id: str,
+) -> dict[str, Any]:
+    """Run one disjoint probe shard; group aggregation remains a later zero-call phase."""
+
+    worker_id = _validated_worker_id(worker_id)
+    profile, selected = _worker_task_ids(output_root, task_ids, comparison_group)
+    started_at_unix = time.time()
+    completed: list[str] = []
+    worker_path = output_root / "evaluation_workers" / f"{worker_id}.json"
+    for task_id in selected:
+        print(f"EVALUATE-WORKER {worker_id} {task_id}", flush=True)
+        evaluate_task(output_root, task_id, timeout, comparison_group)
+        completed.append(task_id)
+        write_json(
+            worker_path,
+            {
+                "schema_version": "aer.pea.probe-worker.v0.6.4-development",
+                "status": "running",
+                "worker_id": worker_id,
+                **_profile_metadata(profile),
+                "task_ids": selected,
+                "completed_task_ids": completed,
+                "started_at_unix": started_at_unix,
+                "updated_at_unix": time.time(),
+            },
+        )
+    result = read_json(worker_path)
+    result["status"] = "complete"
+    result["finished_at_unix"] = time.time()
+    result["duration_seconds"] = result["finished_at_unix"] - started_at_unix
+    write_json(worker_path, result)
+    return result
 
 
 def _turn_start_count(path: Path) -> int:
@@ -1413,6 +2563,50 @@ def _turn_start_count(path: Path) -> int:
         row.get("direction") == "outbound" and row.get("message", {}).get("method") == "turn/start"
         for row in _json_lines(path)
     )
+
+
+def _turn_start_count_many(paths: list[Path]) -> int:
+    return sum(_turn_start_count(path) for path in paths)
+
+
+def _rpc_wall_span(paths: list[Path]) -> dict[str, float] | None:
+    """Return the real wall-clock span covered by one parallel RPC phase."""
+
+    timestamps = [
+        float(timestamp)
+        for path in paths
+        for row in _json_lines(path)
+        if isinstance(timestamp := row.get("unix"), int | float)
+    ]
+    if not timestamps:
+        return None
+    started_at_unix = min(timestamps)
+    finished_at_unix = max(timestamps)
+    return {
+        "started_at_unix": started_at_unix,
+        "finished_at_unix": finished_at_unix,
+        "duration_seconds": finished_at_unix - started_at_unix,
+    }
+
+
+def _validate_group_turn_accounting(
+    profile: RuntimeProfile,
+    *,
+    run_turn_calls: int,
+    probe_turn_calls: int,
+    all_archived_turn_calls: int,
+) -> None:
+    if not isinstance(profile, ComparisonProfile):
+        return
+    if (
+        run_turn_calls != 40
+        or probe_turn_calls != 60
+        or run_turn_calls + probe_turn_calls != 100
+        or all_archived_turn_calls != 100
+    ):
+        raise RuntimeError(
+            "v0.6.4 requires exactly 40 run, 60 probe, and 100 total archived turns"
+        )
 
 
 def _usage_totals(value: Any) -> dict[str, int]:
@@ -1461,16 +2655,57 @@ def _tool_summary(trajectory_path: Path) -> dict[str, Any]:
     }
 
 
-def report(output_root: Path) -> dict[str, Any]:
-    _, _, _, _, _, tasks = _load_contracts()
+def report(
+    output_root: Path, comparison_group: str | None = None
+) -> dict[str, Any]:
+    profile = _runtime_profile(
+        output_root=output_root, comparison_group=comparison_group
+    )
+    _require_comparison_ready(output_root, profile)
+    _, _, _, _, _, tasks = _load_contracts(
+        output_root=output_root,
+        repeat_run=True,
+        comparison_group=comparison_group,
+    )
+    run_summary = read_json(output_root / "run_summary.json")
     evaluation = read_json(output_root / "evaluation_summary.json")
+    _validate_summary_profile_records(run_summary, evaluation, profile)
     if evaluation.get("task_count") != len(tasks):
         raise RuntimeError("the final report requires all 20 Task evaluations")
+    if isinstance(profile, ComparisonProfile) and evaluation.get("scoring_model_calls") != 0:
+        raise RuntimeError("v0.6.4 deterministic scoring must make zero model calls")
+
     diagnostics = []
     all_usage: list[Any] = []
+    all_run_rpc_paths: list[Path] = []
+    all_probe_rpc_paths: list[Path] = []
+    run_turn_calls = 0
+    probe_turn_calls = 0
     for task_id in tasks:
-        run_manifest = read_json(output_root / f"runs/{task_id}/run_manifest.json")
-        task_evaluation = read_json(output_root / f"evaluation/{task_id}/evaluation_result.json")
+        run_root = output_root / "runs" / task_id
+        evaluation_root = output_root / "evaluation" / task_id
+        run_manifest = read_json(run_root / "run_manifest.json")
+        task_evaluation = read_json(evaluation_root / "evaluation_result.json")
+        if isinstance(profile, ComparisonProfile):
+            _validate_profile_record(run_manifest, profile, label=f"main run {task_id}")
+            _validate_profile_record(
+                task_evaluation, profile, label=f"evaluation {task_id}"
+            )
+        run_rpc_paths = [run_root / "app-server-run/app_server_rpc.jsonl"]
+        probe_rpc_paths = sorted(
+            evaluation_root.glob("app-server-evaluation-attempt-*/app_server_rpc.jsonl")
+        )
+        task_run_turns = _turn_start_count_many(run_rpc_paths)
+        task_probe_turns = _turn_start_count_many(probe_rpc_paths)
+        all_run_rpc_paths.extend(run_rpc_paths)
+        all_probe_rpc_paths.extend(probe_rpc_paths)
+        if isinstance(profile, ComparisonProfile) and (task_run_turns, task_probe_turns) != (2, 3):
+            raise RuntimeError(
+                f"{task_id} has {task_run_turns} main-phase and "
+                f"{task_probe_turns} probe-phase model turns; expected 2 and 3"
+            )
+        run_turn_calls += task_run_turns
+        probe_turn_calls += task_probe_turns
         all_usage.extend(
             [
                 run_manifest.get("checkpoint", {}).get("usage"),
@@ -1480,6 +2715,8 @@ def report(output_root: Path) -> dict[str, Any]:
                 task_evaluation.get("P4", {}).get("usage"),
             ]
         )
+        trajectory_path = run_root / "environment/public_environment_trajectory.jsonl"
+        session_paths = sorted((run_root / "codex-home/sessions").rglob("*.jsonl"))
         diagnostics.append(
             {
                 "task_id": task_id,
@@ -1488,163 +2725,328 @@ def report(output_root: Path) -> dict[str, Any]:
                     and run_manifest.get("main", {}).get("output", {}).get("completed") is True
                 ),
                 "main_status": run_manifest.get("main", {}).get("status"),
-                "model_call_count": _turn_start_count(
-                    output_root / f"runs/{task_id}/app-server-run/app_server_rpc.jsonl"
-                )
-                + _turn_start_count(
-                    output_root / f"evaluation/{task_id}/app-server-evaluation/app_server_rpc.jsonl"
-                ),
-                "tool_use": _tool_summary(
-                    output_root / f"runs/{task_id}/environment/public_environment_trajectory.jsonl"
-                ),
+                "probe_status": {
+                    probe: task_evaluation.get(probe, {}).get("status")
+                    for probe in ("P1", "P2", "P4")
+                },
+                "run_turn_count": task_run_turns,
+                "probe_turn_count": task_probe_turns,
+                "model_turn_count": task_run_turns + task_probe_turns,
+                "tool_use": _tool_summary(trajectory_path),
+                "scores": task_evaluation["score"],
+                "artifacts": {
+                    "run_manifest": {
+                        "path": str((run_root / "run_manifest.json").relative_to(output_root)),
+                        "sha256": sha256_path(run_root / "run_manifest.json"),
+                    },
+                    "evaluation_result": {
+                        "path": str(
+                            (evaluation_root / "evaluation_result.json").relative_to(output_root)
+                        ),
+                        "sha256": sha256_path(evaluation_root / "evaluation_result.json"),
+                    },
+                    "public_environment_trajectory": {
+                        "path": str(trajectory_path.relative_to(output_root)),
+                        "sha256": sha256_path(trajectory_path),
+                    },
+                    "native_session_count": len(session_paths),
+                    "native_session_sha256": [sha256_path(path) for path in session_paths],
+                    "run_rpc_sha256": [sha256_path(path) for path in run_rpc_paths],
+                    "probe_rpc_sha256": [sha256_path(path) for path in probe_rpc_paths],
+                },
             }
         )
-    one_shot_calls = len(list((output_root / "construction").glob("**/codex/manifest.json")))
-    turn_calls = sum(item["model_call_count"] for item in diagnostics)
-    results = evaluation["tasks"]
-    wrong_or_reason_review = [
-        {
-            "task_id": row["task_id"],
-            "Detection": row["Detection"],
-            "Triage": row["Triage"],
-            "Discovery": row["Discovery"],
-        }
-        for row in results
-        if not (row["Detection"]["score"] and row["Triage"]["score"] and row["Discovery"]["score"])
+
+    native_turn_calls = run_turn_calls + probe_turn_calls
+    _validate_group_turn_accounting(
+        profile,
+        run_turn_calls=run_turn_calls,
+        probe_turn_calls=probe_turn_calls,
+        all_archived_turn_calls=_run_turn_starts_below(output_root),
+    )
+    run_started = run_summary.get("started_at_unix")
+    run_finished = run_summary.get("finished_at_unix")
+    evaluation_study = evaluation.get("study", {})
+    evaluation_started = evaluation_study.get("started_at_unix")
+    evaluation_finished = evaluation_study.get("finished_at_unix")
+    run_rpc_span = _rpc_wall_span(all_run_rpc_paths)
+    evaluation_rpc_span = _rpc_wall_span(all_probe_rpc_paths)
+    if isinstance(profile, ComparisonProfile) and (
+        run_rpc_span is None or evaluation_rpc_span is None
+    ):
+        raise RuntimeError("v0.6.4 phase timing requires timestamped run and probe RPC evidence")
+    run_seconds = (
+        run_rpc_span["duration_seconds"]
+        if run_rpc_span is not None
+        else run_summary.get("duration_seconds")
+    )
+    evaluation_seconds = (
+        evaluation_rpc_span["duration_seconds"]
+        if evaluation_rpc_span is not None
+        else evaluation_study.get("duration_seconds")
+    )
+    rpc_timing_values = [
+        value
+        for span in (run_rpc_span, evaluation_rpc_span)
+        if span is not None
+        for value in (span["started_at_unix"], span["finished_at_unix"])
     ]
+    legacy_timing_values = [
+        value
+        for value in (run_started, run_finished, evaluation_started, evaluation_finished)
+        if isinstance(value, int | float)
+    ]
+    timing_values = rpc_timing_values or legacy_timing_values
+    phase_timings = {
+        "run_seconds": run_seconds,
+        "evaluation_seconds": evaluation_seconds,
+        "phase_sum_seconds": (
+            run_seconds + evaluation_seconds
+            if isinstance(run_seconds, int | float)
+            and isinstance(evaluation_seconds, int | float)
+            else None
+        ),
+        "elapsed_span_seconds": max(timing_values) - min(timing_values) if timing_values else None,
+        "source": (
+            "recorded_app_server_rpc_unix_span"
+            if rpc_timing_values
+            else "group_summary_phase_timestamps"
+        ),
+        "run_summary_duration_seconds": run_summary.get("duration_seconds"),
+        "evaluation_aggregation_seconds": evaluation_study.get("duration_seconds"),
+    }
+    if isinstance(profile, ComparisonProfile):
+        metric_names = (
+            "Detection",
+            "Triage-Review",
+            "Triage-Mechanism",
+            "Experiment",
+            "Discovery-Existence",
+            "Discovery-Exact",
+        )
+    else:
+        metric_names = ("Detection", "Triage", "Experiment", "Discovery")
     payload = {
-        "schema_version": "aer.pea.handoff-study-report.v0.6-development",
+        "schema_version": (
+            "aer.pea.handoff-study-report.v0.6.4-development"
+            if isinstance(profile, ComparisonProfile)
+            else "aer.pea.handoff-study-report.v0.6-development"
+        ),
         "status": "complete_development_only",
         "promotion_status": "not_accepted",
         "official_leaderboard_result": False,
-        "model": MODEL,
-        "reasoning_effort": REASONING_EFFORT,
-        "fast_mode": FAST_MODE,
-        "metrics": {
-            key: evaluation[key] for key in ("Detection", "Triage", "Experiment", "Discovery")
-        },
+        "llm_judge_used_for_score": False,
+        "model": profile.main_model,
+        **_profile_metadata(profile),
+        "metrics": {key: evaluation[key] for key in metric_names},
         "composite_score": None,
         "call_accounting": {
-            "construction_and_blind_review_one_shot_calls": one_shot_calls,
-            "run_and_evaluation_native_turn_calls": turn_calls,
-            "total_model_calls": one_shot_calls + turn_calls,
-            "registered_calls_per_task_after_handoff_selection": 5,
+            "model_list_catalog_calls": 1 if isinstance(profile, ComparisonProfile) else 0,
+            "model_list_model_turns": 0,
+            "run_native_turn_calls": run_turn_calls,
+            "probe_native_turn_calls": probe_turn_calls,
+            "run_and_evaluation_native_turn_calls": native_turn_calls,
+            "scoring_model_calls": evaluation.get("scoring_model_calls", 0),
+            "total_model_turns": native_turn_calls,
+            "registered_turns_per_task": 5,
             "usage_field_totals_diagnostic_only": _usage_totals(all_usage),
         },
+        "coverage": {
+            "main_archives": len(diagnostics),
+            "P1_archives": sum(item["probe_status"]["P1"] is not None for item in diagnostics),
+            "P2_archives": sum(item["probe_status"]["P2"] is not None for item in diagnostics),
+            "P4_archives": sum(item["probe_status"]["P4"] is not None for item in diagnostics),
+        },
+        "phase_timings": phase_timings,
         "run_evaluate_decoupling": {
             "separate_process_phases": True,
             "scienceworld_started_during_evaluation": False,
             "native_saved_threads_resumed": True,
             "full_rpc_and_session_artifacts_preserved": True,
         },
+        "G0_completed": sum(item["G0_completed"] for item in diagnostics),
+        "tool_event_count": sum(item["tool_use"]["event_count"] for item in diagnostics),
         "diagnostics": diagnostics,
-        "error_and_reason_review_queue": wrong_or_reason_review,
-        "Experiment": "not_run",
+        "Triage-Review": "not_computed",
+        "Experiment": "not_computed",
     }
     write_json(output_root / "study_report.json", payload)
 
-    detection = payload["metrics"]["Detection"]
-    triage = payload["metrics"]["Triage"]
-    discovery = payload["metrics"]["Discovery"]
-    discovery_groups = json.dumps(
-        discovery["macro_by_configuration_group"], ensure_ascii=False, sort_keys=True
-    )
+    if all(
+        isinstance(phase_timings[key], int | float)
+        for key in ("run_seconds", "evaluation_seconds", "phase_sum_seconds")
+    ):
+        timing_line = (
+            f"- 实际 RPC 墙钟：run {phase_timings['run_seconds']:.3f} 秒；"
+            f"probe {phase_timings['evaluation_seconds']:.3f} 秒；"
+            f"active phase sum {phase_timings['phase_sum_seconds']:.3f} 秒。"
+        )
+    else:
+        timing_line = "- 实际 RPC 墙钟：当前归档没有完整时间戳。"
     lines = [
-        "# 豌豆 Case v0.6-development：20 个原生 handoff 实验报告",
+        f"# 豌豆 Case v0.6.4：{profile.group} 单轮报告",
         "",
-        "> 本报告是开发结果，不是 leaderboard 结果；仍需人工盲审后才能晋级。",
+        "> 开发期单轮描述性结果；不是 leaderboard，也不能据此形成稳定模型排名。",
         "",
-        "## 结论摘要",
+        "## 运行合同",
         "",
-        (
-            f"- Detection：均分 {detection['mean']:.3f}，灵敏度 "
-            f"{detection['sensitivity']:.3f}，特异度 {detection['specificity']:.3f}，"
-            f"平衡准确率 {detection['balanced_accuracy']:.3f}。"
-        ),
-        (
-            f"- Triage：均分 {triage['mean']:.3f}，灵敏度 "
-            f"{triage['sensitivity']:.3f}，特异度 {triage['specificity']:.3f}，"
-            f"平衡准确率 {triage['balanced_accuracy']:.3f}。"
-        ),
-        f"- Discovery：均分 {discovery['mean']:.3f}；分组结果 {discovery_groups}。",
-        "- Experiment：本轮按冻结方案不运行；composite score 为空。",
-        f"- 20 个 Task 中完成 G0 的数量：{sum(item['G0_completed'] for item in diagnostics)}/20。",
-        (
-            "- handoff 选定后每个 Task 固定 5 次模型调用（checkpoint、main、P1、P2、P4）；"
-            "总调用账目见 `study_report.json`。"
-        ),
+        f"- Main / Probe 模型：`{profile.main_model}` / `{profile.probe_model}`。",
+        f"- 推理强度：`{profile.reasoning_effort}`；Fast：`{profile.fast_mode}`。",
+        f"- 提示档位：`{profile.prompt_tier}`；Task：20。",
+        f"- 模型 turn：{run_turn_calls} run + {probe_turn_calls} probe = {native_turn_calls}。",
+        timing_line,
+        "- 计分为纯代码路径，模型调用数为 0；Triage 审核口径与 Experiment 未计算。",
         "",
-        "## 运行与评测解耦证据",
+        "## 混淆矩阵与派生指标",
         "",
-        (
-            "主运行阶段只重放冻结 recipe、执行 checkpoint/main 并保存原生 sibling forks；"
-            "评测阶段在新的 app-server 进程中恢复 P1、P2、P4 线程，没有启动 "
-            "ScienceWorld。完整 JSON-RPC、session JSONL、公开环境轨迹和 operator "
-            "windows 均保留。"
-        ),
-        "",
-        "## 逐 Task 结果",
-        "",
-        "| Task | Detection | Triage | Discovery | G0 | 模型调用 | 工具事件 |",
-        "|---|---:|---:|---:|---:|---:|---:|",
+        "| Metric | F1/Exact | TP | FN | FP | TN |",
+        "|---|---:|---:|---:|---:|---:|",
     ]
-    by_task = {row["task_id"]: row for row in results}
-    for diagnostic in diagnostics:
-        row = by_task[diagnostic["task_id"]]
+    for metric in ("Detection", "Triage-Mechanism", "Discovery-Existence"):
+        if metric not in evaluation:
+            continue
+        value = evaluation[metric]
+        counts = value["confusion_counts"]
         lines.append(
-            f"| {row['task_id']} | {row['Detection']['score']} | "
-            f"{row['Triage']['score']} | {row['Discovery']['score']} | "
-            f"{int(diagnostic['G0_completed'])} | {diagnostic['model_call_count']} | "
-            f"{diagnostic['tool_use']['event_count']} |"
+            f"| {metric} | {value['f1']:.6f} | {counts['tp']} | {counts['fn']} | "
+            f"{counts['fp']} | {counts['tn']} |"
+        )
+    if "Discovery-Exact" in evaluation:
+        exact = evaluation["Discovery-Exact"]
+        lines.append(
+            f"| Discovery-Exact | {exact['mean']:.6f} ({exact['correct_count']}/20) | "
+            "— | — | — | — |"
         )
     lines.extend(
         [
             "",
-            "## 需要人工复核的错例",
+            "## 逐 Task",
             "",
-            (
-                "所有三项均正确，没有自动加入错例队列。"
-                if not wrong_or_reason_review
-                else "以下 Task 至少有一项精确匹配失败："
-            ),
+            "| Task | Detection | Triage-Mechanism | Existence | Exact | G0 | Turns | Tools |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
-    for item in wrong_or_reason_review:
+    for item in diagnostics:
+        score = item["scores"]
         lines.append(
-            f"- {item['task_id']}：Detection={item['Detection']['score']}，"
-            f"Triage={item['Triage']['score']}，Discovery={item['Discovery']['score']}。"
+            f"| {item['task_id']} | {score['Detection']['score']} | "
+            f"{score['Triage']['score']} | {score['Discovery-Existence']['score']} | "
+            f"{score['Discovery-Exact']['score']} | {int(item['G0_completed'])} | "
+            f"{item['model_turn_count']} | {item['tool_use']['event_count']} |"
         )
-    lines.append("")
+    lines.extend(
+        [
+            "",
+            "## 阶段耗时",
+            "",
+            f"- Main 阶段：{phase_timings['run_seconds']} 秒。",
+            f"- Probe 阶段：{phase_timings['evaluation_seconds']} 秒。",
+            f"- 两阶段合计：{phase_timings['phase_sum_seconds']} 秒。",
+            "",
+        ]
+    )
     _safe_text(output_root / "study_report.md", "\n".join(lines))
     return payload
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=("construct", "run", "evaluate", "report", "full"))
+    parser.add_argument(
+        "command",
+        choices=(
+            "construct",
+            "prepare",
+            "preflight",
+            "run",
+            "run-worker",
+            "evaluate",
+            "evaluate-worker",
+            "report",
+            "full",
+        ),
+    )
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument(
+        "--formulation-path",
+        type=Path,
+        default=DEFAULT_FORMULATION_PATH,
+        help=(
+            "path to the frozen Formulation.md content; defaults to the original Obsidian "
+            "location and is always verified against the selected contract"
+        ),
+    )
+    parser.add_argument(
+        "--comparison-group",
+        choices=("terra", "luna", "gpt-5.5"),
+        help="contract-bound v0.6.4 model group; omit only for historical v0.6.3 operation",
+    )
     parser.add_argument("--task", action="append")
+    parser.add_argument("--worker-id")
     parser.add_argument("--timeout", type=int, default=1800)
     args = parser.parse_args()
     if args.timeout <= 0:
         parser.error("--timeout must be positive")
-    if args.command == "report" and args.task:
-        parser.error("report always aggregates the complete 20-Task study")
+    if args.command in {"prepare", "preflight"} and args.comparison_group is None:
+        parser.error(f"{args.command} requires --comparison-group")
+    if args.command == "construct" and args.comparison_group is not None:
+        parser.error("v0.6.4 reuses frozen handoffs and forbids construct")
+    if args.command in {"prepare", "preflight", "report"} and args.task:
+        parser.error(f"{args.command} does not accept --task")
+    if args.command in {"run-worker", "evaluate-worker"}:
+        if args.comparison_group is None:
+            parser.error(f"{args.command} requires --comparison-group")
+        if not args.task:
+            parser.error(f"{args.command} requires at least one --task")
+        if args.worker_id is None:
+            parser.error(f"{args.command} requires --worker-id")
+        try:
+            _validated_worker_id(args.worker_id)
+        except ValueError as error:
+            parser.error(str(error))
+    elif args.worker_id is not None:
+        parser.error("--worker-id is valid only for run-worker or evaluate-worker")
     return args
 
 
 def main() -> int:
+    global FORMULATION_PATH
+
     args = _parse_args()
+    FORMULATION_PATH = _resolved_formulation_path(args.formulation_path)
+    if args.comparison_group is not None:
+        _formulation_source(read_json(MODEL_COMPARISON_PATH))
     output_root = args.output.resolve()
     output_root.mkdir(parents=True, exist_ok=True)
-    if args.command in {"construct", "full"}:
+    if args.command == "construct" or (args.command == "full" and args.comparison_group is None):
         construct(output_root, args.task, args.timeout)
+    if args.command in {"prepare", "preflight"} or (
+        args.command == "full" and args.comparison_group is not None
+    ):
+        prepare_comparison_group(output_root, args.comparison_group)
+    if args.command in {"preflight", "full"} and args.comparison_group is not None:
+        preflight_models(output_root)
     if args.command in {"run", "full"}:
-        run_study(output_root, args.task, args.timeout)
+        run_study(output_root, args.task, args.timeout, args.comparison_group)
+    if args.command == "run-worker":
+        run_worker(
+            output_root,
+            args.task,
+            args.timeout,
+            args.comparison_group,
+            args.worker_id,
+        )
     if args.command in {"evaluate", "full"}:
-        evaluate_study(output_root, args.task, args.timeout)
+        evaluate_study(output_root, args.task, args.timeout, args.comparison_group)
+    if args.command == "evaluate-worker":
+        evaluate_worker(
+            output_root,
+            args.task,
+            args.timeout,
+            args.comparison_group,
+            args.worker_id,
+        )
     if args.command in {"report", "full"}:
-        report(output_root)
+        report(output_root, args.comparison_group)
     return 0
 
 

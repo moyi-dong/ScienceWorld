@@ -133,6 +133,7 @@ def _new_service(
         directory / "operator_action_windows.jsonl",
         2_000,
         configuration["noise_levels"],
+        preference_weight=configuration.get("preference_weight"),
     )
     service.actor = actor
     return service

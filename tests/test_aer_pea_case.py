@@ -116,58 +116,35 @@ def test_held_out_split_requires_a_matching_freeze_manifest(tmp_path):
     _validate_split("held_out", 2, 509, freeze)
 
 
-def test_public_notebook_records_are_structured_and_timestamped(tmp_path):
-    service = EpisodeService.__new__(EpisodeService)
+def test_public_notebook_accepts_free_text_and_timestamps_entries(tmp_path):
+    import threading
+    from aer_bench.pea_public_interface import NeutralMixin
+
+    service_type = type("CurrentService", (NeutralMixin, EpisodeService), {})
+    service = service_type.__new__(service_type)
+    service._lock = threading.Lock()
     service._index = 0
     service._note_index = 0
     service._experiment_ids = set()
     service._active_experiment_id = None
     service.trajectory_path = tmp_path / "trajectory.jsonl"
-
-    notice = service._record({"kind": "notice", "surface": "visit_imbalance"})
-    assert notice["record_id"] == "NOTE-0001"
-    assert service._record({"kind": "notice", "surface": "free text"})["ok"] is False
-    registration = service._record(
-        {
-            "kind": "experiment_preregister",
-            "experiment_id": "EXP-swap",
-            "phase": "investigation",
-            "probe_kind": "perceived_color_swap",
-            "hypothesis": "perceived_flower_color",
-            "prediction": "the preference follows displayed white",
-        }
-    )
-    assert registration["ok"] is True
-    assert service._active_experiment_id == "EXP-swap"
-    assert service._record(registration["record"])["ok"] is False
-    assert service._record(
-        {"kind": "experiment_end", "experiment_id": "EXP-other"}
-    )["ok"] is False
-    ended = service._record(
-        {"kind": "experiment_end", "experiment_id": "EXP-swap"}
-    )
-    assert ended["ok"] is True
-    assert service._active_experiment_id is None
-    records = [
-        json.loads(line)
-        for line in service.trajectory_path.read_text(encoding="utf-8").splitlines()
-    ]
-    assert [record["index"] for record in records] == [0, 1, 2]
+    note = service.handle({"command": "record", "record": {
+        "kind": "note", "text": "An unlisted observation."}})
+    assert note["record_id"] == "NOTE-0001"
+    record = {"kind": "experiment", "experiment_id": "EXP-one",
+              "hypothesis": "Scent affects visits.", "prediction": "Visits follow scent."}
+    assert service.handle({"command": "record", "record": record})["ok"]
+    assert service.handle({"command": "record", "record": {
+        "kind": "experiment_end", "experiment_id": "EXP-one"}})["ok"]
+    rows = [json.loads(line) for line in service.trajectory_path.read_text().splitlines()]
+    assert [row["index"] for row in rows] == [0, 1, 2]
 
 
-def test_public_submission_schema_matches_the_case_package():
-    external_schema = json.loads(
-        (Path(__file__).resolve().parents[1] / "scripts/aer_pea_submission.schema.json").read_text(
-            encoding="utf-8"
-        )
-    )
-    case_schema = json.loads(
-        (
-            Path(__file__).resolve().parents[3]
-            / "cases/science/mendelian_genetics_known_plant_aer/public/submission.schema.json"
-        ).read_text(encoding="utf-8")
-    )
-    assert external_schema == case_schema
+def test_public_submission_schema_matches_current_family():
+    from aer_bench.pea_public_interface import submission_schema
+
+    path = Path(__file__).resolve().parents[3] / "families/pea/environment/public/submission.schema.json"
+    assert json.loads(path.read_text()) == submission_schema()
 
 
 def test_matched_pre_exposure_handoff_contains_only_public_observations(tmp_path):
@@ -226,6 +203,33 @@ def test_operator_case_roots_are_validated_and_replay_independently():
         assert root_events[DEV_ROOTS[0]] != root_events[DEV_ROOTS[1]]
     finally:
         env.close()
+
+
+def test_operator_replay_branch_validates_and_maps_the_v04_profile():
+    calls = []
+
+    class FakeServer:
+        def configureAERPeaCaseReplayBranchV04(self, *args):
+            calls.append(args)
+            return "configured"
+
+    env = ScienceWorldEnv.__new__(ScienceWorldEnv)
+    env.server = FakeServer()
+    env.close = lambda: None
+    noise = {
+        "soil_nutrient_lot": "medium",
+        "fruit_set_success": "weak",
+        "cross_parentage_contamination": "strong",
+    }
+
+    assert env.configure_aer_pea_replay_branch(
+        "clean", 1001, preference_weight=2.0, noise_levels=noise
+    ) == "configured"
+    assert calls == [("clean", 1001, 2.0, 2, 1, 3)]
+    with pytest.raises(ValueError, match="non-negative integer"):
+        env.configure_aer_pea_replay_branch("clean", True)
+    with pytest.raises(ValueError, match="must contain"):
+        env.configure_aer_pea_replay_branch("clean", 1001, noise_levels={})
 
 
 def test_operator_can_version_preference_strength_without_changing_legacy_default():

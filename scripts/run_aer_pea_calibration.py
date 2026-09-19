@@ -7,7 +7,6 @@ import argparse
 import hashlib
 import importlib.util
 import json
-import re
 import shutil
 import socketserver
 import sys
@@ -32,31 +31,6 @@ MODEL = "gpt-5.6-sol"
 REASONING_EFFORT = "high"
 PROMPT_VARIANTS = ("baseline", "anomaly_cue")
 ANOMALY_CUE = "Pay attention to anomalies during the task and explore the underlying mechanisms."
-NOTE_SURFACES = {
-    "visit_imbalance",
-    "fruit_set_timing",
-    "none",
-    "undetermined",
-}
-NOTE_MECHANISMS = {
-    "perceived_flower_color",
-    "flower_pot_position",
-    "plant_identity",
-    "post_pollination_fruit_set_speed",
-    "finite_sample_fluctuation",
-    "uniform_no_anomaly",
-    "undetermined",
-}
-PROBE_KINDS = {
-    "additional_sampling",
-    "expanded_sampling",
-    "position_swap",
-    "perceived_color_swap",
-    "reciprocal_manual_pollination",
-    "restoration",
-    "fresh_flowering_period",
-}
-
 SCRIPT_DIR = Path(__file__).resolve().parent
 SCIENCEWORLD_ROOT = SCRIPT_DIR.parent
 AER_BENCH_ROOT = SCIENCEWORLD_ROOT.parents[1]
@@ -122,7 +96,6 @@ def _validate_split(
 class EpisodeService:
     """Own one hidden world while exposing only the native public interaction surface."""
 
-    note_mechanisms = NOTE_MECHANISMS
 
     def __init__(
         self,
@@ -134,9 +107,15 @@ class EpisodeService:
         step_limit: int,
         matched_pre_exposure: bool = False,
         noise_levels: dict[str, str] | None = None,
+        preference_weight: float | None = None,
     ) -> None:
         self.env = ScienceWorldEnv("", serverPath=None, envStepLimit=step_limit)
-        self.env.configure_aer_pea_case(world, case_root, noise_levels=noise_levels)
+        preference_options = (
+            {} if preference_weight is None else {"preference_weight": preference_weight}
+        )
+        self.env.configure_aer_pea_case(
+            world, case_root, noise_levels=noise_levels, **preference_options
+        )
         self.env.load(TASK, variation, "easy", generateGoldPath=matched_pre_exposure)
         self.trajectory_path = trajectory_path
         self.operator_window_path = operator_window_path
@@ -230,82 +209,6 @@ class EpisodeService:
             )
         return response
 
-    def _record(self, raw_record: Any) -> dict[str, Any]:
-        if not isinstance(raw_record, dict):
-            return {"ok": False, "error": "record must be an object"}
-        record_kind = raw_record.get("kind")
-        if record_kind in {"notice", "prioritize"}:
-            if set(raw_record) != {"kind", "surface"}:
-                return {"ok": False, "error": "notice/prioritize fields must be kind and surface"}
-            if raw_record.get("surface") not in NOTE_SURFACES:
-                return {"ok": False, "error": "unsupported notebook surface"}
-            self._note_index += 1
-            record_id = f"NOTE-{self._note_index:04d}"
-            response = {
-                "ok": True,
-                "kind": "record",
-                "record_id": record_id,
-                "record": raw_record,
-            }
-        elif record_kind == "experiment_preregister":
-            required = {
-                "kind",
-                "experiment_id",
-                "phase",
-                "probe_kind",
-                "hypothesis",
-                "prediction",
-            }
-            if set(raw_record) != required:
-                return {"ok": False, "error": "invalid experiment_preregister fields"}
-            experiment_id = raw_record.get("experiment_id")
-            if (
-                not isinstance(experiment_id, str)
-                or not re.fullmatch(r"EXP-[A-Za-z0-9_-]{1,32}", experiment_id)
-                or experiment_id in self._experiment_ids
-            ):
-                return {"ok": False, "error": "experiment_id is invalid or already registered"}
-            if raw_record.get("phase") not in {"investigation", "validation"}:
-                return {"ok": False, "error": "phase must be investigation or validation"}
-            if raw_record.get("probe_kind") not in PROBE_KINDS:
-                return {"ok": False, "error": "unsupported probe_kind"}
-            if raw_record.get("hypothesis") not in self.note_mechanisms:
-                return {"ok": False, "error": "unsupported hypothesis"}
-            if not isinstance(raw_record.get("prediction"), str) or not raw_record["prediction"]:
-                return {"ok": False, "error": "prediction must be a non-empty string"}
-            self._experiment_ids.add(experiment_id)
-            self._active_experiment_id = experiment_id
-            response = {
-                "ok": True,
-                "kind": "record",
-                "experiment_id": experiment_id,
-                "record": raw_record,
-            }
-        elif record_kind == "experiment_end":
-            if set(raw_record) != {"kind", "experiment_id"}:
-                return {"ok": False, "error": "invalid experiment_end fields"}
-            experiment_id = raw_record.get("experiment_id")
-            if experiment_id != self._active_experiment_id:
-                return {"ok": False, "error": "experiment_id is not active"}
-            self._active_experiment_id = None
-            response = {
-                "ok": True,
-                "kind": "record",
-                "experiment_id": experiment_id,
-                "record": raw_record,
-            }
-        else:
-            return {"ok": False, "error": "unsupported notebook record kind"}
-
-        self._append(
-            {
-                "source": "solver",
-                "request": {"command": "record", "record": raw_record},
-                "response": response,
-            }
-        )
-        return response
-
     def handle(self, request: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
             command = request.get("command")
@@ -368,8 +271,6 @@ class EpisodeService:
                         "results": results,
                         "completed": self.completed,
                     }
-            elif command == "record":
-                return self._record(request.get("record"))
             else:
                 response = {"ok": False, "error": "unsupported public command"}
 

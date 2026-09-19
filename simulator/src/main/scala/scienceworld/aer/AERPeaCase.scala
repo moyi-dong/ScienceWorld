@@ -198,6 +198,68 @@ object AERPeaCase {
     requestedProtocolV04 = true
   }
 
+  /**
+    * Reconfigure only the future AER mechanism and random streams of a loaded episode.
+    *
+    * This operator-only hook is used by the Experiment differential replayer.  The caller
+    * deterministically reconstructs an archived pre-action state, invokes this method, and
+    * then executes exactly one registered solver action.  Physical state, stable object IDs,
+    * historical events, and public cursors are deliberately preserved.  Random generators
+    * that can affect future AER observations are restarted from replaySeed so that every
+    * candidate World receives the same matched pre-action state and an independently
+    * registered future seed.
+    */
+  def configureReplayBranchV04(
+    worldName: String,
+    replaySeed: Int,
+    preferenceWeight: Double,
+    soilNutrientNoise: Int,
+    fruitSetNoise: Int,
+    contaminationNoise: Int
+  ): Unit = {
+    if (!enabled) {
+      throw new IllegalStateException("AER pea replay branching requires a loaded episode")
+    }
+    if (!SUPPORTED_WORLDS.contains(worldName)) {
+      throw new IllegalArgumentException(
+        "Unknown AER pea world '" + worldName + "'. Supported worlds: " +
+          SUPPORTED_WORLDS.toArray.sorted.mkString(", ")
+      )
+    }
+    if (replaySeed < 0) {
+      throw new IllegalArgumentException("AER pea replay seed must be non-negative")
+    }
+    if (preferenceWeight.isNaN || preferenceWeight.isInfinity || preferenceWeight < 1.0) {
+      throw new IllegalArgumentException(
+        "AER pea preference weight must be finite and at least 1.0"
+      )
+    }
+    val noiseLevels = Array(soilNutrientNoise, fruitSetNoise, contaminationNoise)
+    if (noiseLevels.exists(level => level < 0 || level > 3)) {
+      throw new IllegalArgumentException("AER pea noise levels must be integers from 0 to 3")
+    }
+
+    requestedWorld = worldName
+    requestedPreferenceWeight = preferenceWeight
+    requestedSoilNutrientNoise = soilNutrientNoise
+    requestedFruitSetNoise = fruitSetNoise
+    requestedContaminationNoise = contaminationNoise
+    requestedProtocolV04 = true
+    episodeSeed = replaySeed
+
+    beeActionRNGs.clear()
+    beeChoiceRNGs.clear()
+    beeMovementRNGs.clear()
+    growthRNGs.clear()
+    fruitSetRNGs.clear()
+    contaminationRNGs.clear()
+    soilLotIndexes.clear()
+    transientRootSeed = None
+    transientChoiceRNG = None
+    cleanRootSeed = None
+    cleanChoiceRNG = None
+  }
+
   def beginEpisode(taskName: String, variationIdx: Int): Unit = {
     enabled = taskName == TASK_NAME
     // Root zero preserves the exact prototype stream. Non-zero case roots are
@@ -383,10 +445,13 @@ object AERPeaCase {
   private def ensurePreferenceTarget(flowers: Array[Flower]): Unit = {
     val nativeWhite = flowers.filter(_.getNativeColor == "white").sortBy(_.uuid).headOption
 
-    if (requestedWorld == WORLD_POSITION_ATTRACTION && preferredFlowerPot.isEmpty) {
+    // Record both counterfactual anchors at the first comparable choice.  Only the anchor
+    // selected by requestedWorld affects live behavior; retaining the other one makes a later
+    // operator-only replay branch causal rather than assigning a target after an intervention.
+    if (preferredFlowerPot.isEmpty) {
       preferredFlowerPot = nativeWhite.map(flowerPot)
     }
-    if (requestedWorld == WORLD_PLANT_ATTRACTIVENESS && preferredPlantId.isEmpty) {
+    if (preferredPlantId.isEmpty) {
       preferredPlantId = nativeWhite.map(plantId)
     }
   }

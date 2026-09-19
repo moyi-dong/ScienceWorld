@@ -61,96 +61,9 @@ WORLD_CONCLUSIONS = {
     "transient_null": "finite_sample_fluctuation",
     "clean": "uniform_no_anomaly",
 }
-PUBLIC_HELP = {
-    "batch_target_rule": "Every changed pot must be named explicitly; 1-20 unique targets.",
-    "post_task_exploration": (
-        "Completing the commissioned score does not close v0.4 batch cultivation, controlled "
-        "crosses, resolved waits, pots, or notebook records. Finish anomaly validation before "
-        "the final submission."
-    ),
-    "commands": {
-        "operate_water": {
-            "operation": "water",
-            "targets": ["flower pot 1", "flower pot 3"],
-        },
-        "operate_sow": {
-            "operation": "sow",
-            "assignments": [
-                {"seed_id": "seed-0", "pot": "flower pot 1"},
-                {"seed_id": "seed-1", "pot": "flower pot 3"},
-            ],
-        },
-        "cultivate": {
-            "assignments": [{"seed_id": "seed-0", "pot": "flower pot 1"}],
-            "target_stage": "flowering",
-            "max_ticks": 100,
-            "maintain_water": True,
-        },
-        "controlled-cross": {
-            "crosses": [
-                {
-                    "recipient_pot": "flower pot 1",
-                    "pollen_pot": "flower pot 3",
-                    "emasculated": True,
-                    "bagged": True,
-                }
-            ]
-        },
-        "wait-until": {
-            "attempt_ids": ["cross-0"],
-            "condition": "resolved",
-            "scope": "all",
-            "max_ticks": 100,
-            "maintain_water": True,
-        },
-        "observe-visits": {
-            "targets": ["flower pot 1", "flower pot 3"],
-            "min_visits": 12,
-            "max_ticks": 100,
-            "maintain_water": True,
-        },
-    },
-    "wait_conditions": [
-        "seedling", "adult", "reproducing", "flowering", "fruit", "resolved"
-    ],
-    "notebook": {
-        "notice": {"kind": "notice", "surface": "undetermined"},
-        "prioritize": {"kind": "prioritize", "surface": "undetermined"},
-        "experiment_preregister": {
-            "kind": "experiment_preregister",
-            "experiment_id": "EXP-followup-1",
-            "phase": "investigation",
-            "probe_kind": "expanded_sampling",
-            "hypothesis": "undetermined",
-            "prediction": "state the result that would distinguish the live alternatives",
-        },
-        "experiment_end": {
-            "kind": "experiment_end",
-            "experiment_id": "EXP-followup-1",
-        },
-        "surfaces": ["visit_imbalance", "fruit_set_timing", "none", "undetermined"],
-        "probe_kinds": [
-            "expanded_sampling",
-            "position_swap",
-            "perceived_color_swap",
-            "reciprocal_manual_pollination",
-            "fresh_flowering_period",
-        ],
-        "hypotheses": [
-            "perceived_flower_color",
-            "flower_pot_position",
-            "plant_identity",
-            "post_pollination_fruit_set_speed",
-            "cross_direction_fruit_set_delay",
-            "fruit_set_stochastic_failure",
-            "cross_parentage_contamination",
-            "soil_nutrient_lot",
-            "finite_sample_fluctuation",
-            "uniform_no_anomaly",
-            "undetermined",
-        ],
-    },
-}
+from aer_bench.pea_public_interface import help_response  # noqa: E402
+
+PUBLIC_HELP = help_response()
 
 
 def load_hidden_configuration_matrix(path: Path = MATRIX_MANIFEST) -> dict[str, dict[str, Any]]:
@@ -209,12 +122,6 @@ def load_hidden_configuration_matrix(path: Path = MATRIX_MANIFEST) -> dict[str, 
 class V1EpisodeService(EpisodeService):
     """Development service with explicit-target mutations and completion-aware waits."""
 
-    note_mechanisms = EpisodeService.note_mechanisms | {
-        "cross_direction_fruit_set_delay",
-        "fruit_set_stochastic_failure",
-        "cross_parentage_contamination",
-        "soil_nutrient_lot",
-    }
 
     def __init__(
         self,
@@ -225,6 +132,7 @@ class V1EpisodeService(EpisodeService):
         operator_window_path: Path,
         step_limit: int,
         noise_levels: dict[str, str],
+        preference_weight: float | None = None,
     ) -> None:
         super().__init__(
             world,
@@ -234,6 +142,7 @@ class V1EpisodeService(EpisodeService):
             operator_window_path,
             step_limit,
             noise_levels=noise_levels,
+            preference_weight=preference_weight,
         )
 
     def _status(self, *, compact: bool = False) -> dict[str, Any]:

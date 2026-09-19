@@ -213,6 +213,22 @@ class PythonInterface() {
       soilNutrientNoise + ":" + fruitSetNoise + ":" + contaminationNoise
   }
 
+  def configureAERPeaCaseReplayBranchV04(
+    worldName:String,
+    replaySeed:Int,
+    preferenceWeight:Double,
+    soilNutrientNoise:Int,
+    fruitSetNoise:Int,
+    contaminationNoise:Int
+  ):String = {
+    AERPeaCase.configureReplayBranchV04(
+      worldName, replaySeed, preferenceWeight,
+      soilNutrientNoise, fruitSetNoise, contaminationNoise
+    )
+    return worldName + ":replay:" + replaySeed + ":" + preferenceWeight + ":v0.4:" +
+      soilNutrientNoise + ":" + fruitSetNoise + ":" + contaminationNoise
+  }
+
   def getAERPeaCaseEventsJSON():String = AERPeaCase.eventsJSON
 
   def getAERPeaCaseReproductionEventsJSON():String = AERPeaCase.reproductionEventsJSON
