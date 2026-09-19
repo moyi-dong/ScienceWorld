@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build and pilot the formulation-aligned 20-Task pea development matrix."""
+"""Build and pilot the formulation-aligned pea development matrix."""
 
 from __future__ import annotations
 

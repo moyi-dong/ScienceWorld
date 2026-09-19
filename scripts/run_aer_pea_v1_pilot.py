@@ -46,7 +46,7 @@ V1_ROOT = AER_PEA_CASE_ROOT / "revisions" / "v1_development"
 V1_CLIENT = V1_ROOT / "public" / "lab.py"
 V1_SCHEMA = V1_ROOT / "public" / "submission.schema.json"
 MATRIX_MANIFEST = V1_ROOT / "construction" / "hidden-configuration-matrix.v0.4.1-development.json"
-MAX_BATCH_TARGETS = 20
+MAX_BATCH_TARGETS = 6
 NO_ADDED_NOISE = {
     "soil_nutrient_lot": "none",
     "fruit_set_success": "none",

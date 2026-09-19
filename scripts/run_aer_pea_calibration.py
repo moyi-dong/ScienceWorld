@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import re
 import shutil
 import socketserver
 import sys
@@ -46,6 +47,51 @@ sys.path.insert(0, str(AER_BENCH_ROOT / "src"))
 
 from aer_bench.codex_runner import CodexRunConfig, CodexRunner  # noqa: E402
 from aer_bench.trace import normalize_events, read_jsonl, write_normalized  # noqa: E402
+
+
+def _pot_sort_key(name: str) -> tuple[int, str]:
+    match = re.search(r"(\d+)$", name)
+    return (int(match.group(1)), name) if match else (10**9, name)
+
+
+def _greenhouse_snapshot(status: dict[str, Any]) -> dict[str, str]:
+    """Build a compact, solver-safe map from pot names to visible plant/flower state."""
+    snapshot: dict[str, str] = {}
+    for pot in sorted(status.get("pots", []), key=lambda value: _pot_sort_key(value["name"])):
+        flowers: list[tuple[str, str]] = []
+        plants = pot.get("plants", [])
+        for plant in plants:
+            plant_id = str(plant.get("plant_id", "?"))
+            for flower in plant.get("active_flowers", []):
+                flowers.append((str(flower.get("perceived_color", "unknown")), plant_id))
+        if flowers:
+            colors = "/".join(color for color, _ in flowers)
+            plant_ids = ",".join(dict.fromkeys(plant_id for _, plant_id in flowers))
+            snapshot[pot["name"]] = f"{colors} flower (plant {plant_ids})"
+        elif plants:
+            plant_ids = ",".join(str(plant.get("plant_id", "?")) for plant in plants)
+            stages = "/".join(str(plant.get("stage", "unknown")) for plant in plants)
+            snapshot[pot["name"]] = f"no active flower (plant {plant_ids}, stage {stages})"
+        else:
+            snapshot[pot["name"]] = "empty"
+    return snapshot
+
+
+def _greenhouse_note(
+    status: dict[str, Any], previous: dict[str, str] | None, action: str
+) -> tuple[str | None, dict[str, str]]:
+    current = _greenhouse_snapshot(status)
+    normalized = " ".join(action.lower().split())
+    force_full = previous is None or normalized == "look around" or "greenhouse" in normalized
+    tick = status.get("episode_tick", "?")
+    if force_full:
+        values = "; ".join(f"{name}={value}" for name, value in current.items())
+        return f"Greenhouse flower map at tick {tick}: {values}", current
+    changed = [name for name in current if current.get(name) != previous.get(name)]
+    if not changed:
+        return None, current
+    values = "; ".join(f"{name}={current[name]}" for name in changed)
+    return f"Greenhouse flower update at tick {tick}: {values}", current
 
 
 def _safe_write_json(path: Path, value: Any) -> None:
@@ -125,6 +171,7 @@ class EpisodeService:
         self._experiment_ids: set[str] = set()
         self._active_experiment_id: str | None = None
         self.completed = False
+        self._last_greenhouse_state: dict[str, str] | None = None
         self.pre_exposure_observations: list[str] = []
         if matched_pre_exposure:
             gold_actions = list(self.env.server.getGoldActionSequence())
@@ -165,6 +212,12 @@ class EpisodeService:
         after_events = self.env.get_aer_pea_case_events()
         after_reproduction_events = self.env.get_aer_pea_case_reproduction_events()
         after_summary = self.env.get_aer_pea_case_summary()
+        greenhouse_status = self.env.get_aer_pea_case_public_status()
+        greenhouse_note, self._last_greenhouse_state = _greenhouse_note(
+            greenhouse_status, self._last_greenhouse_state, action
+        )
+        if greenhouse_note:
+            observation = f"{observation}\n\n{greenhouse_note}"
         self.completed = bool(completed)
         response = {
             "ok": True,

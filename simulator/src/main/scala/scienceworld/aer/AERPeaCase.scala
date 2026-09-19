@@ -76,7 +76,10 @@ object AERPeaCase {
   val TRANSIENT_STREAK_COLORS = Array("purple", "purple", "purple", "white")
   val TRANSIENT_BALANCE_COLORS = Array("purple", "purple", "purple", "white", "white", "white")
   val LEGACY_FLOWER_POT_COUNT = 6
-  val V04_FLOWER_POT_COUNT = 20
+  // The current pea case restores the six-pot layout used by the original
+  // Mendelian-genetics task.  The v0.8.0 artifacts remain available under the
+  // release tag; new handoffs use this six-pot protocol.
+  val V04_FLOWER_POT_COUNT = 6
 
   val SUPPORTED_WORLDS = Set(
     WORLD_WHITE_PREFERENCE,
@@ -819,8 +822,7 @@ object AERPeaCase {
 
     val visitLines = fresh.map { event =>
       (event.tick, event.index, "- At greenhouse tick " + event.tick +
-        ", a bee entered a " + event.perceivedColor + " flower [flower " + event.flowerId +
-        "] on the " + event.plantHeight + " pea plant in " + event.flowerPot + ".")
+        ", a bee entered a " + event.perceivedColor + " flower in " + event.flowerPot + ".")
     }
     val reproductionLines = freshReproduction.map { event =>
       val verb = event.eventType match {
@@ -832,8 +834,7 @@ object AERPeaCase {
       }
       (event.tick, visits.length + event.index, "- At greenhouse tick " + event.tick +
         ", a " + event.nativeColor +
-        " flower [flower " + event.flowerId + "] on the " + event.plantHeight +
-        " pea plant in " + event.flowerPot + verb + ".")
+        " flower in " + event.flowerPot + verb + ".")
     }
     val lines = (visitLines ++ reproductionLines).sortBy(item => (item._1, item._2)).map(_._3)
     "Greenhouse activity since your last action:\n" + lines.mkString("\n")
@@ -1028,13 +1029,10 @@ object AERPeaCase {
           "\"soil_lot_id\":\"" + soilLotName(plant) + "\"," +
           "\"active_flowers\":[" + plantFlowers.map { flower =>
             "{" +
-              "\"flower_id\":" + stableId(flowerIds, flower.uuid) + "," +
               "\"perceived_color\":\"" + escapeJSON(flower.getPerceivedColor) + "\"" +
               "}"
           }.mkString(",") + "]," +
-          "\"active_flower_ids\":[" + plantFlowers.map { flower =>
-            stableId(flowerIds, flower.uuid)
-          }.mkString(",") + "]}"
+          "\"active_flower_count\":" + plantFlowers.length + "}"
       }
       val podCount = crossAttempts.count { attempt =>
         attempt.recipientPot == pot.name && attempt.status == "pod_set"
@@ -1075,7 +1073,6 @@ object AERPeaCase {
       "{" +
         "\"event_type\":\"" + escapeJSON(event.eventType) + "\"," +
         "\"tick\":" + event.tick + "," +
-        "\"flower_id\":" + event.flowerId + "," +
         "\"recipient_plant_id\":" + event.plantId + "," +
         "\"recipient_height\":\"" + escapeJSON(event.plantHeight) + "\"," +
         "\"flower_pot\":\"" + escapeJSON(event.flowerPot) + "\"," +
@@ -1085,7 +1082,6 @@ object AERPeaCase {
     val publicAttempts = crossAttempts.sortBy(_.attemptId).map { attempt =>
       "{" +
         "\"attempt_id\":\"cross-" + attempt.attemptId + "\"," +
-        "\"flower_id\":" + attempt.flowerId + "," +
         "\"recipient_plant_id\":" + attempt.recipientPlantId + "," +
         "\"recipient_pot\":\"" + escapeJSON(attempt.recipientPot) + "\"," +
         "\"intended_pollen_plant_id\":" + attempt.intendedPollenPlantId + "," +
