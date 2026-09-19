@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import shutil
+import sys
 import tempfile
 import threading
 import time
@@ -765,6 +766,9 @@ def run_episode(
     step_limit: int,
     noise_levels: dict[str, str],
     configuration: dict[str, Any] | None = None,
+    model: str = MODEL,
+    reasoning_effort: str = REASONING_EFFORT,
+    benchmark_version: str = "pea-v0.8.1",
 ) -> dict[str, Any]:
     configuration_id = configuration["id"] if configuration is not None else None
     run_prefix = configuration_id or world
@@ -804,8 +808,8 @@ def run_episode(
                 artifact_dir=artifact_dir / "codex",
                 prompt=prompt,
                 output_schema=workspace / "submission.schema.json",
-                model=MODEL,
-                reasoning_effort=REASONING_EFFORT,
+                model=model,
+                reasoning_effort=reasoning_effort,
                 timeout_seconds=timeout_seconds,
                 sandbox="workspace-write",
                 ephemeral=True,
@@ -856,13 +860,154 @@ def run_episode(
         "case_root": case_root,
         "repetition": repetition,
         "noise_levels": noise_levels,
-        "model": MODEL,
-        "reasoning_effort": REASONING_EFFORT,
+        "model": model,
+        "reasoning_effort": reasoning_effort,
+        "benchmark_version": benchmark_version,
         "fast_mode": False,
         "status": result.status,
         "returncode": result.returncode,
         "errors": result.errors,
         "usage": result.usage,
+        "thread_id": result.thread_id,
+        "started_at_unix": started,
+        "finished_at_unix": time.time(),
+        "environment_completed": service.completed,
+        "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+        "scienceworld_jar_sha256": _sha256(SCIENCEWORLD_ROOT / "scienceworld" / "scienceworld.jar"),
+        "checks": checks,
+    }
+    _safe_write_json(artifact_dir / "run_metadata.json", metadata)
+    return metadata
+
+
+def run_deepseek_episode(
+    output_root: Path,
+    *,
+    world: str,
+    repetition: int,
+    variation: int,
+    case_root: int,
+    timeout_seconds: int,
+    step_limit: int,
+    noise_levels: dict[str, str],
+    configuration: dict[str, Any] | None = None,
+    benchmark_version: str = "pea-v0.8.1",
+) -> dict[str, Any]:
+    """Run one episode through the official DeepSeek relay and native harness."""
+
+    dsh_site = (
+        Path.home()
+        / ".local"
+        / "share"
+        / "aer-bench"
+        / "dsh-0.1.2rc1"
+        / "lib"
+        / "python3.12"
+        / "site-packages"
+    )
+    if dsh_site.is_dir() and str(dsh_site) not in sys.path:
+        sys.path.insert(0, str(dsh_site))
+    from aer_bench.deepseek_harness import Relay, load_key, run_turn
+
+    configuration_id = configuration["id"] if configuration is not None else None
+    run_prefix = configuration_id or world
+    run_id = (
+        f"v1-{run_prefix}-variation-{variation:02d}-root-{case_root:04d}-run-{repetition:02d}"
+    )
+    artifact_dir = output_root / run_id
+    if artifact_dir.exists():
+        raise RuntimeError(f"refusing to overwrite {artifact_dir}")
+    artifact_dir.mkdir(parents=True)
+
+    with tempfile.TemporaryDirectory(prefix="dsp1-", dir="/tmp") as temporary:
+        root = Path(temporary)
+        workspace = root / "workspace"
+        workspace.mkdir()
+        home = root / "main-home"
+        shutil.copy2(V1_CLIENT, workspace / "lab.py")
+        shutil.copy2(V1_SCHEMA, workspace / "submission.schema.json")
+        socket_path = workspace / "scienceworld.sock"
+        trajectory_path = artifact_dir / "public_environment_trajectory.jsonl"
+        operator_window_path = artifact_dir / "operator_action_windows.jsonl"
+        service = V1EpisodeService(
+            world,
+            variation,
+            case_root,
+            trajectory_path,
+            operator_window_path,
+            step_limit,
+            noise_levels,
+        )
+        server = _UnixServer(str(socket_path), _Handler)
+        server.episode = service  # type: ignore[attr-defined]
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        started = time.time()
+        result = None
+        prompt = ""
+        try:
+            prompt = _prompt(service)
+            schema = json.loads(V1_SCHEMA.read_text(encoding="utf-8"))
+            with Relay(load_key(), artifact_dir / "api") as relay:
+                turn = run_turn(
+                    home,
+                    workspace,
+                    relay,
+                    "You are an autonomous scientific agent operating only the public "
+                    "greenhouse client.",
+                    prompt,
+                    schema,
+                    "main",
+                    artifact_dir,
+                    timeout=timeout_seconds,
+                )
+                result = turn
+            hidden_summary = service.env.get_aer_pea_case_summary()
+            hidden_events = service.env.get_aer_pea_case_events()
+            hidden_reproduction = service.env.get_aer_pea_case_reproduction_events()
+        finally:
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=5)
+            service.close()
+
+    if result is None:
+        raise RuntimeError("DeepSeek episode produced no turn result")
+    trajectory = read_jsonl(trajectory_path)
+    _safe_write_json(artifact_dir / "hidden_summary.json", hidden_summary)
+    _safe_write_json(artifact_dir / "hidden_events.json", hidden_events)
+    _safe_write_json(artifact_dir / "hidden_reproduction_events.json", hidden_reproduction)
+    checks: dict[str, Any] | None = None
+    if result.output is not None:
+        checks = _automatic_checks(
+            result.output,
+            trajectory,
+            hidden_summary,
+            world,
+            configuration,
+        )
+        _safe_write_json(artifact_dir / "automatic_pilot_checks.json", checks)
+    metadata = {
+        "schema_version": "aer.pea.v1-pilot-run.v0.4.1",
+        "run_id": run_id,
+        "hidden_configuration_id": configuration_id,
+        "hidden_configuration_group": (
+            configuration["group"] if configuration is not None else None
+        ),
+        "world": world,
+        "variation": variation,
+        "case_root": case_root,
+        "repetition": repetition,
+        "noise_levels": noise_levels,
+        "model": "deepseek-v4-flash",
+        "reasoning_effort": "high",
+        "benchmark_version": benchmark_version,
+        "harness": "official-deepseek-relay",
+        "fast_mode": False,
+        "status": result.status,
+        "returncode": 0 if result.status == "completed" else 1,
+        "errors": result.errors,
+        "usage": None,
         "thread_id": result.thread_id,
         "started_at_unix": started,
         "finished_at_unix": time.time(),
